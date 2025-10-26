@@ -5,12 +5,53 @@ import { WebSocketServer } from "ws";
 import * as ES from "eventsource"; const EventSource = ES.default ?? ES;
 import axios from "axios";
 import { DateTime } from "luxon";
+// near top with other imports
+import { startPolygonWatch } from "./polygon.js";
+
+// --- Logging bootstrap ---
+import morgan from "morgan";
+import { v4 as uuidv4 } from "uuid";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+
+attachAxiosLogging(axios, "tradier");      // your default axios (Tradier usage)
+//attachAxiosLogging(ALPACA, "alpaca");      // your Alpaca axios instance
+//attachAxiosLogging(POLY, "polygon");       // your Polygon axios instance
+
+export const reqStore = new AsyncLocalStorage();
+
+const app = express();
+app.use(cors());
+
+// Attach a request-id and put it into AsyncLocalStorage
+app.use((req, res, next) => {
+  const rid = req.headers["x-request-id"]?.toString() || uuidv4();
+  req.id = rid;
+  // expose provider (if any) for logging
+  const provider = (req.query?.provider || "").toString().toLowerCase() || "n/a";
+
+  reqStore.run({ rid, provider, started: Date.now() }, () => {
+    res.setHeader("x-request-id", rid);
+    next();
+  });
+});
+
+// morgan token for req.id and provider
+morgan.token("rid", (req) => req.id);
+morgan.token("provider", (req) => (req.query?.provider || "n/a").toString());
+
+// Example format: [rid] METHOD URL status len - response-time ms (provider)
+app.use(
+  morgan(
+    '[:rid] :method :url :status :res[content-length] - :response-time ms (provider=:provider)'
+  )
+);
 
 const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=8080, WS_PORT=8081 } = process.env;
 if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 
-const app = express();
-app.use(cors());
+//const app = express();
+//app.use(cors());
 
 const wss = new WebSocketServer({ port: Number(WS_PORT) });
 const broadcast = (msg) => {
@@ -234,9 +275,184 @@ function startQuoteStream(symbolsOrOCC=[]) {
   }
 }
 
-/* ------------------------ /watch (existing) ------------------------ */
+
+let stopCurrentWatch = null;
+
 app.get("/watch", async (req, res) => {
   try {
+    const provider = String(req.query.provider || "tradier").toLowerCase();
+
+    // Use syms (not "symbols") to avoid clashes anywhere else
+    const syms = String(req.query.symbols || "SPY")
+      .split(",")
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    const eqForTS = String(req.query.eqForTS || syms.join(","))
+      .split(",")
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
+    const day          = parseDay(req);
+
+    const moneyness = req.query.moneyness ? Number(req.query.moneyness) : 0.25;
+    const limit     = req.query.limit ? Number(req.query.limit) : 150;
+    const expiries  = String(req.query.expiries || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    // cancel any previous loops
+    if (typeof stopCurrentWatch === "function") {
+      try { stopCurrentWatch(); } catch {}
+      stopCurrentWatch = null;
+    }
+
+    console.log(`[watch] provider=${provider} syms=${syms.join(",")} eqForTS=${eqForTS.join(",")} backfill=${backfillMins} mny=${moneyness} limit=${limit}`);
+
+    if (provider === "polygon") {
+      // start polygon polling loops
+      stopCurrentWatch = await startPolygonWatch({
+        equities: syms,
+        moneyness,
+        limit,
+        broadcast,
+        classifyOptionAction: classifyOpenClose,
+      });
+
+      return res.json({
+        ok: true,
+        provider: "polygon",
+        env: { provider: "polygon", base: "https://api.polygon.io", delayed: true },
+        watching: { equities: syms, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
+      });
+    }
+
+    // ---- TRADIER (default) ----
+    const occSet = new Set();
+    for (const root of syms) {
+      try {
+        const occ = await buildOptionsWatchList(
+          root,
+          { expiries, moneyness, limit: Math.ceil(limit / Math.max(1, syms.length)) }
+        );
+        occ.forEach(x => occSet.add(x));
+      } catch (e) {
+        console.warn("buildOptionsWatchList failed", root, errToJson(e));
+      }
+    }
+
+    startQuoteStream([...syms, ...occSet]);
+
+    if (backfillMins > 0) {
+      await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, backfillMins)));
+    }
+
+    return res.json({
+      ok: true,
+      provider: "tradier",
+      env: { provider: "tradier", base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
+      watching: { equities: syms, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
+    });
+
+  } catch (e) {
+    const detail = errToJson(e);
+    console.error("/watch error:", detail);
+    res.status(detail.status || 500).json({ ok:false, error: detail });
+  }
+});
+
+/*
+let stopCurrentWatch = null; // allow switching providers without restarting the server
+
+app.get("/watch", async (req, res) => {
+  try {
+    console.log(
+      `[${req.id}] /watch symbols=${symbols.join(",")} eqForTS=${eqForTS.join(",")} provider=${provider} backfill=${backfillMins} mny=${moneyness} limit=${limit}`
+    );
+    const provider = String(req.query.provider || "tradier").toLowerCase();
+
+    const symbols   = String(req.query.symbols || "SPY")
+      .split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+
+    const eqForTS   = String(req.query.eqForTS || symbols.join(","))
+      .split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+
+    const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
+    const day          = parseDay(req);
+
+    const moneyness = req.query.moneyness ? Number(req.query.moneyness) : 0.25;
+    const limit     = req.query.limit ? Number(req.query.limit) : 150;
+    const expiries  = String(req.query.expiries || "").split(",").map(s=>s.trim()).filter(Boolean);
+
+    // stop any prior loops when switching providers
+    if (typeof stopCurrentWatch === "function") {
+      try { stopCurrentWatch(); } catch {}
+      stopCurrentWatch = null;
+    }
+
+    if (provider === "polygon") {
+      // === Polygon (15-min delayed on lower tiers): poll quotes/trades and broadcast frames ===
+      stopCurrentWatch = await startPolygonWatch({
+        equities: symbols,
+        moneyness,
+        limit,
+        broadcast,                 // your existing broadcast(msg)
+        classifyOptionAction: classifyOpenClose, // reuse your BTO/BTC/STO/STC heuristic
+      });
+
+      return res.json({
+        ok: true,
+        env: { provider: "polygon", base: "https://api.polygon.io", delayed: true },
+        watching: { equities: symbols, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
+      });
+    }
+
+    // === Default: Tradier real-time (your existing path) ===
+    const occSet = new Set();
+    for (const s of symbols) {
+      try {
+        const occ = await buildOptionsWatchList(
+          s,
+          { expiries, moneyness, limit: Math.ceil(limit / Math.max(1, symbols.length)) }
+        );
+        occ.forEach(x => occSet.add(x));
+      } catch (e) {
+        console.warn("buildOptionsWatchList failed", s, errToJson(e));
+      }
+    }
+
+    // start real-time SSE quotes (equities + options OCCs)
+    startQuoteStream([...symbols, ...occSet]);
+
+    // optional equity backfill from Tradier timesales
+    if (backfillMins > 0) {
+      await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, backfillMins)));
+    }
+
+    console.log(
+      `[${req.id}] /watch OK -> ${provider} equities=${symbols.length} opts=${provider === 'polygon' ? 0 : occSet.size}`
+    );
+
+    return res.json({
+      ok: true,
+      env: { provider: "tradier", base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
+      watching: { equities: symbols, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
+    });
+
+  } catch (e) {
+    const detail = errToJson(e);
+    console.error("/watch error:", detail);
+    res.status(detail.status || 500).json({ ok:false, error: detail });
+  }
+});
+*/
+
+/* ------------------------ /watch (existing) ------------------------
+app.get("/watch", async (req, res) => {
+  try {
+    const provider = String(req.query.provider || "tradier").toLowerCase();
     const symbols = String(req.query.symbols || "SPY").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
     const eqForTS = String(req.query.eqForTS || symbols.join(",")).split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
     const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
@@ -267,6 +483,7 @@ app.get("/watch", async (req, res) => {
     res.status(detail.status || 500).json({ ok:false, error: detail });
   }
 });
+*/
 
 /* ======================== NEW: SCANNERS ======================== */
 
@@ -525,6 +742,50 @@ const ALPACA = axios.create({
   },
   timeout: 15_000
 });
+
+// --- Axios outbound logging helper ---
+function attachAxiosLogging(instance, label = "axios") {
+  instance.interceptors.request.use((config) => {
+    const store = reqStore.getStore();
+    const rid = store?.rid || "n/a";
+    const pvd = store?.provider || "n/a";
+    const started = Date.now();
+    // stash start time on the config for duration calc
+    config.headers = config.headers || {};
+    config.headers["x-request-id"] = rid; // propagate rid downstream
+    config.metadata = { started };
+
+    const url = `${config.baseURL || ""}${config.url || ""}`;
+    console.log(
+      `[${rid}] -> ${label} ${config.method?.toUpperCase()} ${url} params=${JSON.stringify(config.params || {})} provider=${pvd}`
+    );
+    return config;
+  });
+
+  instance.interceptors.response.use(
+    (resp) => {
+      const rid = reqStore.getStore()?.rid || "n/a";
+      const dur = (resp.config.metadata?.started ? Date.now() - resp.config.metadata.started : 0);
+      const url = `${resp.config.baseURL || ""}${resp.config.url || ""}`;
+      console.log(
+        `[${rid}] <- ${label} ${resp.status} ${url} (${dur} ms)`
+      );
+      return resp;
+    },
+    (err) => {
+      const store = reqStore.getStore();
+      const rid = store?.rid || "n/a";
+      const dur = (err.config?.metadata?.started ? Date.now() - err.config.metadata.started : 0);
+      const url = `${err.config?.baseURL || ""}${err.config?.url || ""}`;
+      const status = err.response?.status || "ERR";
+      const msg = err.response?.data?.message || err.message;
+      console.warn(
+        `[${rid}] <- ${label} ${status} ${url} (${dur} ms) error=${msg}`
+      );
+      return Promise.reject(err);
+    }
+  );
+}
 
 // Most Actives (by volume or trade_count)
 async function alpacaMostActives({ by = "volume", top = 25 } = {}) {
