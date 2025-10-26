@@ -162,6 +162,69 @@ async function fetchNewTrades(ticker) {
   return rows;
 }
 
+async function polyTopMovers() {
+  // /v2/snapshot/locale/us/markets/stocks/gainers | losers
+  const [g, l] = await Promise.all([
+    POLY.get("/v2/snapshot/locale/us/markets/stocks/gainers"),
+    POLY.get("/v2/snapshot/locale/us/markets/stocks/losers"),
+  ]);
+  // Each row has: ticker, day, lastTrade, min, prevDay, etc.
+  return {
+    gainers: Array.isArray(g.data?.tickers) ? g.data.tickers : [],
+    losers:  Array.isArray(l.data?.tickers) ? l.data.tickers : [],
+  };
+}
+
+async function polyMostActives({ by="volume", top=30 } = {}) {
+  // /v2/snapshot/locale/us/markets/stocks/tickers
+  const r = await POLY.get("/v2/snapshot/locale/us/markets/stocks/tickers");
+  const rows = Array.isArray(r.data?.tickers) ? r.data.tickers : [];
+  // derive fields
+  const norm = rows.map(t => {
+    const vol = Number(t.day?.v ?? t.day?.volume ?? 0);
+    const tradeCount = Number(t.day?.n ?? t.day?.transactions ?? 0);
+    const last = Number(t.lastTrade?.p ?? 0);
+    return {
+      symbol: t.ticker,
+      volume: vol,
+      trade_count: tradeCount,
+      last,
+      change_percent: Number(t.todaysChangePerc ?? 0) / 100, // polygon gives % already; normalize to 0..1
+    };
+  });
+  const key = by === "trade_count" ? "trade_count" : "volume";
+  return norm.sort((a,b)=> (b[key]||0)-(a[key]||0)).slice(0, top);
+}
+
+async function polyUOAForRoot(root, { moneyness = 0.2, minVol = 500 } = {}) {
+  // /v3/snapshot/options/{underlying}
+  // (This returns many contracts; filter by moneyness around underlying)
+  const snap = await POLY.get(`/v3/snapshot/options/${encodeURIComponent(root)}`);
+  const und = Number(snap.data?.underlying_asset?.price ?? 0);
+  const arr = Array.isArray(snap.data?.results) ? snap.data.results : [];
+
+  const within = (o) => {
+    if (!und) return true;
+    const strike = Number(o.details?.strike_price ?? o.details?.strike ?? 0);
+    return und > 0 ? Math.abs(strike - und) / und <= moneyness : true;
+  };
+
+  const flagged = arr
+    .map(o => ({
+      occ: o.ticker, // Polygon options ticker e.g. O:NVDA241101C00450000
+      vol: Number(o.day?.volume ?? 0),
+      oi:  Number(o.open_interest ?? 0),
+      last: Number(o.last_trade?.price ?? 0),
+      strike: Number(o.details?.strike_price ?? 0),
+      right: String(o.details?.contract_type ?? "call").toUpperCase().startsWith("C") ? "C" : "P",
+    }))
+    .filter(x => x.vol >= minVol && x.vol > x.oi && within({ details: { strike_price: x.strike } }))
+    .sort((a,b)=> (b.vol||0)-(a.vol||0))
+    .slice(0, 3);
+
+  return { count: flagged.length, top: flagged };
+}
+
 // Public API: start polygon “watch” (polling loops that broadcast WS frames)
 export async function startPolygonWatch({
   equities = [],

@@ -22,6 +22,7 @@ export const reqStore = new AsyncLocalStorage();
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: "64kb" }));
 
 // Attach a request-id and put it into AsyncLocalStorage
 app.use((req, res, next) => {
@@ -59,11 +60,25 @@ const broadcast = (msg) => {
   for (const c of wss.clients) if (c.readyState === 1) c.send(s);
 };
 
-const H_JSON = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "application/json" };
-const H_SSE  = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "text/event-stream" };
+// const H_JSON = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "application/json" };
+// const H_SSE  = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "text/event-stream" };
 const isSandbox = TRADIER_BASE.includes("sandbox");
 const TS_INTERVAL = isSandbox ? "1min" : "tick";
 const errToJson = (e) => (e?.response ? { status: e.response.status, data: e.response.data } : { message: String(e) });
+
+// ---- dynamic credentials (in-memory) ----
+const CREDENTIALS = {
+  tradier: { token: process.env.TRADIER_TOKEN || "" },
+  alpaca:  { key: process.env.APCA_API_KEY_ID || "", secret: process.env.APCA_API_SECRET_KEY || "" },
+};
+
+// dynamic headers for Tradier (read current token)
+function H_JSON() {
+  return { Authorization: `Bearer ${CREDENTIALS.tradier.token}`, Accept: "application/json" };
+}
+function H_SSE() {
+  return { Authorization: `Bearer ${CREDENTIALS.tradier.token}`, Accept: "text/event-stream" };
+}
 
 function parseDay(req) {
   const d = String(req.query.day || "").trim();
@@ -150,7 +165,7 @@ async function backfillEquityTS(symbol, day, minutes = 5) {
       start: start.toFormat("yyyy-LL-dd HH:mm:ss"),
       end: end.toFormat("yyyy-LL-dd HH:mm:ss"),
     };
-    const { data } = await axios.get(`${TRADIER_BASE}/markets/timesales`, { headers: H_JSON, params });
+    const { data } = await axios.get(`${TRADIER_BASE}/markets/timesales`, { headers: H_JSON(), params });
     (data?.series?.data ?? []).forEach(tick => {
       const price = Number(tick.price ?? tick.last ?? tick.close ?? 0);
       const { side, side_src } = inferSideServer(symbol, price);
@@ -172,11 +187,11 @@ async function backfillEquityTS(symbol, day, minutes = 5) {
 
 /* ------------------------ options helpers (existing) ------------------------ */
 async function getExpirations(symbol) {
-  const { data } = await axios.get(`${TRADIER_BASE}/markets/options/expirations`, { headers: H_JSON, params: { symbol } });
+  const { data } = await axios.get(`${TRADIER_BASE}/markets/options/expirations`, { headers: H_JSON(), params: { symbol } });
   return data?.expirations?.date ?? [];
 }
 async function getUnderlyingLast(symbol) {
-  const { data } = await axios.get(`${TRADIER_BASE}/markets/quotes`, { headers: H_JSON, params: { symbols: symbol } });
+  const { data } = await axios.get(`${TRADIER_BASE}/markets/quotes`, { headers: H_JSON(), params: { symbols: symbol } });
   const q = data?.quotes?.quote;
   return Array.isArray(q) ? (+q[0]?.last || +q[0]?.close || 0) : (+q?.last || +q?.close || 0);
 }
@@ -185,7 +200,7 @@ async function buildOptionsWatchList(symbol, { expiries=[], moneyness=0.25, limi
   const und = await getUnderlyingLast(symbol);
   let exps = expiries.length ? expiries : (await getExpirations(symbol)).slice(0,1);
   for (const exp of exps) {
-    const { data } = await axios.get(`${TRADIER_BASE}/markets/options/chains`, { headers: H_JSON, params: { symbol, expiration: exp } });
+    const { data } = await axios.get(`${TRADIER_BASE}/markets/options/chains`, { headers: H_JSON(), params: { symbol, expiration: exp } });
     const arr = data?.options?.option || [];
     for (const o of arr) {
       oiByOcc.set(o.symbol, Number(o.open_interest || 0));
@@ -207,7 +222,7 @@ function startQuoteStream(symbolsOrOCC=[]) {
     const uniq = [...new Set(symbolsOrOCC)].filter(Boolean);
     if (uniq.length === 0) return;
     const url = `${TRADIER_BASE}/markets/events?symbols=${encodeURIComponent(uniq.join(","))}&sessionid=${Date.now()}`;
-    const es  = new EventSource(url, { headers: H_SSE }); esQuotes = es;
+    const es  = new EventSource(url, { headers: H_SSE() }); esQuotes = es;
 
     es.onmessage = (e) => {
       try {
@@ -592,6 +607,25 @@ app.get('/popular', async (_req, res) => {
 // replace your /popular route with this one
 app.get('/popular', async (req, res) => {
   try {
+    const provider = String(req.query.provider || "alpaca").toLowerCase();
+    let symbols1 = [];
+
+    if (provider === "polygon") {
+      try {
+        const act = await polyMostActives({ by: "trade_count", top: 40 });
+        symbols1 = act.map(x => x.symbol);
+        return res.json({ ok: true, ts: Date.now(), source: "polygon", symbols1 });
+      } catch {
+        // fall through to your existing cache/fallback
+        const force = req.query.force === '1';
+        let by = String(req.query.by || 'trades').toLowerCase();
+        if (!['trades','volume'].includes(by)) by = 'trades';
+        const top = Math.max(1, Math.min(100, Number(req.query.top || 40)));
+
+        const { symbols, cached, meta } = await getPopularRoots({ force, by, top });
+        res.json({ ok: true, ts: POPULAR_CACHE.ts, cached, symbols, meta });        
+      }
+    }    
     const force = req.query.force === '1';
     let by = String(req.query.by || 'trades').toLowerCase();
     if (!['trades','volume'].includes(by)) by = 'trades';
@@ -611,7 +645,7 @@ async function getQuotesBatch(symbols) {
   for (let i=0; i<symbols.length; i+=CHUNK) {
     const slice = symbols.slice(i, i+CHUNK);
     const { data } = await axios.get(`${TRADIER_BASE}/markets/quotes`, {
-      headers: H_JSON, params: { symbols: slice.join(",") }
+      headers: H_JSON(), params: { symbols: slice.join(",") }
     });
     const q = data?.quotes?.quote;
     if (!q) continue;
@@ -627,7 +661,7 @@ async function scanOptionsUOA(root, { moneyness=0.2, minVol=500 } = {}) {
     const exps = await getExpirations(root);
     if (!exps?.length) return { count: 0, top: [] };
     const near = exps[0];
-    const { data } = await axios.get(`${TRADIER_BASE}/markets/options/chains`, { headers: H_JSON, params: { symbol: root, expiration: near } });
+    const { data } = await axios.get(`${TRADIER_BASE}/markets/options/chains`, { headers: H_JSON(), params: { symbol: root, expiration: near } });
     const arr = data?.options?.option || [];
     // estimate underlying
     const und = await getUnderlyingLast(root);
@@ -661,6 +695,43 @@ function bucketByAvgVol(avgVol) {
  */
 app.get("/scan", async (req, res) => {
   try {
+    const provider = String(req.query.provider || "alpaca").toLowerCase();
+    const by = String(req.query.by || "volume"); // "volume" | "trade_count"
+    const top = Number(req.query.top || 25);
+    // const moneyness = Number(req.query.moneyness || 0.2);
+    // const minVol = Number(req.query.minVol || 500);
+
+    if (provider === "polygon") {
+      // Gather
+      const [act, mv] = await Promise.all([
+        polyMostActives({ by, top }),
+        polyTopMovers()
+      ]);
+
+      // UOA for top N by activity
+      const roots = act.slice(0, Math.min(20, act.length)).map(x => x.symbol);
+      const uoaMap = {};
+      await Promise.all(roots.map(async (r) => { uoaMap[r] = await polyUOAForRoot(r, { moneyness, minVol }); }));
+
+      const decorate = (arr) => arr.map(r => ({
+        ...r,
+        uoa_count: uoaMap[r.symbol]?.count ?? 0,
+        uoa_top: uoaMap[r.symbol]?.top ?? []
+      }));
+
+      return res.json({
+        ok: true,
+        ts: Date.now(),
+        provider: "polygon",
+        groups: {
+          most_actives: decorate(act),
+          gainers: mv.gainers,
+          losers: mv.losers,
+        },
+        params: { by, top, moneyness, minVol }
+      });
+    }
+    
     const symbols = (String(req.query.symbols || "") || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
     //const roots = symbols.length ? symbols : await getPopularRoots();
     const { symbols: dynRoots } = await getPopularRoots();
@@ -742,6 +813,13 @@ const ALPACA = axios.create({
   },
   timeout: 15_000
 });
+
+function applyAlpacaHeaders() {
+  if (!ALPACA) return;
+  if (CREDENTIALS.alpaca.key)    ALPACA.defaults.headers["Apca-Api-Key-Id"] = CREDENTIALS.alpaca.key;
+  if (CREDENTIALS.alpaca.secret) ALPACA.defaults.headers["Apca-Api-Secret-Key"] = CREDENTIALS.alpaca.secret;
+}
+applyAlpacaHeaders();
 
 // --- Axios outbound logging helper ---
 function attachAxiosLogging(instance, label = "axios") {
@@ -872,6 +950,10 @@ app.get("/alpaca/scan", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
     }
 
+    if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret) {
+      return res.status(400).json({ ok:false, error:"Missing Alpaca credentials" });
+    }
+
     let payload;
     if (refresh) {
       // // Pull most-actives + movers
@@ -983,7 +1065,53 @@ app.get('/popular/combined', async (req, res) => {
 });
 
 /* ======================== END ALPACA SCANNER (NEW) ======================== */
+// POST /settings/credentials
+// body: { tradier?: { token }, alpaca?: { key, secret } }
+app.post("/settings/credentials", async (req, res) => {
+  try {
+    const { tradier, alpaca } = req.body || {};
 
+    if (tradier?.token) {
+      CREDENTIALS.tradier.token = String(tradier.token).trim();
+    }
+    if (alpaca?.key)    CREDENTIALS.alpaca.key    = String(alpaca.key).trim();
+    if (alpaca?.secret) CREDENTIALS.alpaca.secret = String(alpaca.secret).trim();
+    applyAlpacaHeaders();
+
+    // Optional shallow validation (won't log secrets)
+    const tests = [];
+    if (tradier?.token) {
+      tests.push(
+        axios.get(`${TRADIER_BASE}/markets/quotes`, {
+          headers: H_JSON(),
+          params: { symbols: "SPY" },
+          validateStatus: () => true
+        }).then(r => ({ provider:"tradier", status:r.status }))
+         .catch(() => ({ provider:"tradier", status:0 }))
+      );
+    }
+    if (alpaca?.key || alpaca?.secret) {
+      tests.push(
+        ALPACA.get("/v1beta1/screener/stocks/most-actives", {
+          params: { by:"volume", top:1 },
+          validateStatus: () => true
+        }).then(r => ({ provider:"alpaca", status:r.status }))
+         .catch(() => ({ provider:"alpaca", status:0 }))
+      );
+    }
+    const results = await Promise.all(tests);
+
+    const test = {};
+    for (const r of results) {
+      test[r.provider] = { ok: r.status && r.status < 400 };
+    }
+
+    // Don’t restart streams automatically here — the client will call /watch right after save.
+    res.json({ ok:true, test });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: errToJson(e) });
+  }
+});
 /* ------------------------ boot ------------------------ */
 app.listen(Number(PORT), () => {
   console.log(`HTTP on ${PORT} | WS on ${WS_PORT}`);
