@@ -2,7 +2,9 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 
-import { WebSocketServer } from 'ws';
+// import { WebSocketServer } from 'ws';
+import { WebSocket } from 'ws';
+
 import * as ES from "eventsource"; const EventSource = ES.default ?? ES;
 import axios from "axios";
 import { DateTime } from "luxon";
@@ -60,7 +62,7 @@ app.use(
 );
 
 //const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=RENDER_PORT, WS_PORT=8081 } = process.env;
-const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=RENDER_PORT, WS_PORT=8081 } = process.env;
+const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=RENDER_PORT, WS_PORT=RENDER_PORT } = process.env;
 if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 
 //const app = express();
@@ -77,11 +79,23 @@ const server = http.createServer(app);
 // Create WebSocket server with proper config
 
 // const wss = new WebSocket.Server({ 
-const wss = new WebSocketServer({ 
-  server,
-  perMessageDeflate: false, // Important for Render
-  clientTracking: true
-});
+// const wss = new WebSocketServer({ 
+//   server,
+//   perMessageDeflate: false, // Important for Render
+//   clientTracking: true
+// });
+
+const wss = new WebSocket.Server({ server, path: '/ws' })
+
+// WebSocket connections
+wss.on('connection', (ws) => {
+  console.log('WebSocket client connected')
+
+  ws.on('message', (message) => {
+    console.log('Received:', message.toString())
+    ws.send(`Hello over WebSocket!`)
+  })
+})
 
 
 //const wss = new WebSocketServer({ server, path: "/ws" }); //({ port: Number(WS_PORT) });
@@ -185,7 +199,26 @@ function classifyOpenClose({ qty, oi, priorVol, side, at }) {
   }
   return { action: "—", action_conf: "low" };
 }
-
+async function polyMostActives({ by="volume", top=30 } = {}) {
+  // /v2/snapshot/locale/us/markets/stocks/tickers
+  const r = await POLY.get("/v2/snapshot/locale/us/markets/stocks/tickers");
+  const rows = Array.isArray(r.data?.tickers) ? r.data.tickers : [];
+  // derive fields
+  const norm = rows.map(t => {
+    const vol = Number(t.day?.v ?? t.day?.volume ?? 0);
+    const tradeCount = Number(t.day?.n ?? t.day?.transactions ?? 0);
+    const last = Number(t.lastTrade?.p ?? 0);
+    return {
+      symbol: t.ticker,
+      volume: vol,
+      trade_count: tradeCount,
+      last,
+      change_percent: Number(t.todaysChangePerc ?? 0) / 100, // polygon gives % already; normalize to 0..1
+    };
+  });
+  const key = by === "trade_count" ? "trade_count" : "volume";
+  return norm.sort((a,b)=> (b[key]||0)-(a[key]||0)).slice(0, top);
+}
 /* ------------------------ equity backfill (existing) ------------------------ */
 async function backfillEquityTS(symbol, day, minutes = 5) {
   try {
