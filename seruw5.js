@@ -11,7 +11,7 @@ import { DateTime } from "luxon";
 import http from 'http';
 import { createServer } from 'http';
 // near top with other imports
-import { startPolygonWatch } from "./polygon.js";
+import { POLY, startPolygonWatch } from "./polygon.js";
 
 // --- Logging bootstrap ---
 import morgan from "morgan";
