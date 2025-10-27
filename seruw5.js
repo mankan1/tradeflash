@@ -22,6 +22,14 @@ export const reqStore = new AsyncLocalStorage();
 
 const app = express();
 app.use(cors());
+
+// Important: Add CORS and headers
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', '*');
+  next();
+});
+
 app.use(express.json({ limit: "64kb" }));
 
 // Attach a request-id and put it into AsyncLocalStorage
@@ -48,13 +56,31 @@ app.use(
   )
 );
 
-const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=8080, WS_PORT=8081 } = process.env;
+//const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=RENDER_PORT, WS_PORT=8081 } = process.env;
+const { TRADIER_BASE="", TRADIER_TOKEN="", PORT=RENDER_PORT, WS_PORT=8081 } = process.env;
 if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 
 //const app = express();
 //app.use(cors());
 
-const wss = new WebSocketServer({ port: Number(WS_PORT) });
+
+const server = http.createServer(app);
+
+const WebSocket = require('ws')
+const PORT = process.env.PORT || 3000;
+
+//const wss = new WebSocket.Server({ server })
+
+// Create WebSocket server with proper config
+const wss = new WebSocket.Server({ 
+  server,
+  perMessageDeflate: false, // Important for Render
+  clientTracking: true
+});
+
+
+//const wss = new WebSocketServer({ server, path: "/ws" }); //({ port: Number(WS_PORT) });
+
 const broadcast = (msg) => {
   const s = JSON.stringify(msg);
   for (const c of wss.clients) if (c.readyState === 1) c.send(s);
@@ -292,6 +318,10 @@ function startQuoteStream(symbolsOrOCC=[]) {
 
 
 let stopCurrentWatch = null;
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
 app.get("/watch", async (req, res) => {
   try {
