@@ -86,7 +86,7 @@ const PORT1 = process.env.PORT || 10000
 //   clientTracking: true
 // });
 
-const wss = new WebSocket.Server({ server, path: '/ws' })
+const wss = new WebSocketServer({ server, path: '/ws' })
 
 // WebSocket connections
 wss.on('connection', (ws) => {
