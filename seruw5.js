@@ -5,7 +5,7 @@ import { WebSocketServer } from "ws";
 import * as ES from "eventsource"; const EventSource = ES.default ?? ES;
 import axios from "axios";
 import { DateTime } from "luxon";
-const http = require('http');
+import { createServer } from 'http';
 // near top with other imports
 import { startPolygonWatch } from "./polygon.js";
 
