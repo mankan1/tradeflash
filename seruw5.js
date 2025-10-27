@@ -358,8 +358,439 @@ async function buildOptionsWatchList(symbol, { expiries=[], moneyness=0.25, limi
   }
   return out;
 }
+/* ------------------------ streaming quotes (robust) ------------------------ */
+// let esQuotes: EventSource | null = null;
 
-/* ------------------------ streaming quotes (existing) ------------------------ */
+// function startQuoteStream(symbolsOrOCC: string[] = []) {
+//   try {
+//     if (esQuotes) esQuotes.close();
+//     const uniq = [...new Set(symbolsOrOCC)].filter(Boolean);
+//     if (uniq.length === 0) return;
+
+//     const url = `${TRADIER_BASE}/markets/events?symbols=${encodeURIComponent(
+//       uniq.join(",")
+//     )}&sessionid=${Date.now()}`;
+//     const es = new EventSource(url, { headers: H_SSE() });
+//     esQuotes = es;
+
+//     // --- DEBUG counters ---
+//     let qCnt = 0,
+//       tCnt = 0,
+//       occQuoteCnt = 0,
+//       occTradeCnt = 0,
+//       optionTsCnt = 0;
+
+//     es.onmessage = (e: MessageEvent) => {
+//       try {
+//         const msg = JSON.parse(e.data);
+
+//         // ---- increment counters sanely (no ++(ternary)) ----
+//         if (msg?.type === "quote") qCnt++;
+//         else if (msg?.type === "trade") tCnt++;
+//         else qCnt++; // bucket unknowns with quotes
+
+//         // sample log every 200th message of that type
+//         const cur =
+//           msg?.type === "quote" ? qCnt : msg?.type === "trade" ? tCnt : qCnt;
+//         if (msg?.type && cur % 200 === 1) {
+//           console.log(
+//             `[SSE ${msg.type}] sample`,
+//             msg?.data?.symbol || msg?.symbol,
+//             { qCnt, tCnt }
+//           );
+//         }
+
+//         // ================== TRADE path ==================
+//         if (msg?.type === "trade" && msg?.data) {
+//           const tr: any = msg.data;
+//           const sym = tr.symbol;
+//           const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(sym);
+//           if (isOCC) occTradeCnt++;
+
+//           const price = Number(tr.price ?? tr.last ?? tr.p ?? 0);
+//           const qty = Number(tr.size ?? tr.s ?? tr.quantity ?? tr.last_size ?? 0);
+
+//           // keep NBBO if available on this frame
+//           if (tr.bid != null || tr.ask != null) updateMidFromQuote(tr);
+
+//           if (isOCC && price > 0 && qty > 0) {
+//             const { side, side_src } = inferSideServer(sym, price);
+//             const book = midBySym.get(sym) || {};
+//             const eps = epsFor(book);
+//             let at: "bid" | "ask" | "mid" | "between" = "between";
+//             if (book.ask && price >= book.ask - eps) at = "ask";
+//             else if (book.bid && price <= book.bid + eps) at = "bid";
+//             else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
+
+//             // update vol trackers for open/close heuristic
+//             const seenVol = Number(tr.volume ?? NaN);
+//             let priorVol = volByOcc.has(sym) ? volByOcc.get(sym) : 0;
+//             if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - qty);
+//             if (Number.isFinite(seenVol)) volByOcc.set(sym, seenVol);
+//             else volByOcc.set(sym, (volByOcc.get(sym) || 0) + qty);
+//             const oi = oiByOcc.get(sym) ?? null;
+
+//             const { action, action_conf } = classifyOpenClose({
+//               qty,
+//               oi,
+//               priorVol,
+//               side,
+//               at,
+//             });
+
+//             optionTsCnt++;
+//             if (optionTsCnt % 100 === 1) {
+//               console.log("[SRV option_ts TRADE]", sym, {
+//                 qty,
+//                 price,
+//                 side,
+//                 at,
+//                 action,
+//                 priorVol,
+//                 oi,
+//               });
+//             }
+
+//             broadcast({
+//               type: "option_ts",
+//               symbol: sym,
+//               provider: "tradier",
+//               data: {
+//                 id: `ots_${sym}_${tr.trade_time || Date.now()}`,
+//                 ts: Date.now(),
+//                 option: {
+//                   expiry: "",
+//                   strike: 0,
+//                   right: /C\d{8}$/i.test(sym) ? "C" : "P",
+//                 },
+//                 qty,
+//                 price,
+//                 side,
+//                 side_src,
+//                 oi,
+//                 priorVol,
+//                 book,
+//                 at,
+//                 action,
+//                 action_conf,
+//               },
+//             });
+//             return;
+//           }
+
+//           // non-OCC trades: fall through (equity prints handled via quotes path too)
+//         }
+
+//         // ================== QUOTE path ==================
+//         if (msg?.type === "quote" && msg?.data) {
+//           const q: any = msg.data;
+
+//           // always keep NBBO cache fresh
+//           if (q?.bid != null || q?.ask != null) updateMidFromQuote(q);
+
+//           const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol);
+//           if (isOCC) occQuoteCnt++;
+
+//           // “trade-like” fields sometimes ride on quote frames
+//           const price = Number(q.last ?? q.price ?? q.p ?? 0);
+//           const qty = Number(
+//             q.size ?? q.trade_size ?? q.last_size ?? q.quantity ?? 0
+//           );
+
+//           if (price > 0 && qty > 0) {
+//             // Broadcast quotes (equity prints + context) with a side on the root
+//             const rootSym = isOCC
+//               ? q.symbol.replace(/\d{6}[CP]\d{8}$/, "")
+//               : q.symbol;
+//             const { side, side_src } = inferSideServer(rootSym, price);
+//             broadcast({ type: "quotes", data: q, side, side_src, provider: "tradier" });
+
+//             if (isOCC) {
+//               const optSide = inferSideServer(q.symbol, price);
+//               const book = midBySym.get(q.symbol) || {};
+//               const eps = epsFor(book);
+//               let at: "bid" | "ask" | "mid" | "between" = "between";
+//               if (book.ask && price >= book.ask - eps) at = "ask";
+//               else if (book.bid && price <= book.bid + eps) at = "bid";
+//               else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
+
+//               const seenVol = Number(q.volume ?? NaN);
+//               let priorVol = volByOcc.has(q.symbol) ? volByOcc.get(q.symbol) : 0;
+//               if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - qty);
+//               if (Number.isFinite(seenVol)) volByOcc.set(q.symbol, seenVol);
+//               else volByOcc.set(q.symbol, (volByOcc.get(q.symbol) || 0) + qty);
+//               const oi = oiByOcc.get(q.symbol) ?? null;
+
+//               const { action, action_conf } = classifyOpenClose({
+//                 qty,
+//                 oi,
+//                 priorVol,
+//                 side: optSide.side,
+//                 at,
+//               });
+
+//               optionTsCnt++;
+//               if (optionTsCnt % 100 === 1) {
+//                 console.log("[SRV option_ts QUOTE]", q.symbol, {
+//                   qty,
+//                   price,
+//                   side: optSide.side,
+//                   at,
+//                   action,
+//                   priorVol,
+//                   oi,
+//                 });
+//               }
+
+//               broadcast({
+//                 type: "option_ts",
+//                 symbol: q.symbol,
+//                 provider: "tradier",
+//                 data: {
+//                   id: `ots_${q.symbol}_${q.trade_time || Date.now()}`,
+//                   ts: Date.now(),
+//                   option: {
+//                     expiry: "",
+//                     strike: 0,
+//                     right: /C\d{8}$/i.test(q.symbol) ? "C" : "P",
+//                   },
+//                   qty,
+//                   price,
+//                   side: optSide.side,
+//                   side_src: optSide.side_src,
+//                   oi,
+//                   priorVol,
+//                   book,
+//                   at,
+//                   action,
+//                   action_conf,
+//                 },
+//               });
+//               return;
+//             }
+
+//             // non-OCC “trade-like quote”: already broadcast as quotes
+//           } else {
+//             // NBBO-only update
+//             broadcast({ type: "quotes", data: q, provider: "tradier" });
+//           }
+
+//           return;
+//         }
+//       } catch (err) {
+//         console.warn("[SSE parse error]", err);
+//       }
+//     };
+
+//     es.onerror = () => {
+//       console.warn(
+//         `[SSE error] restarting. totals: quote=${qCnt}, trade=${tCnt}, occQ=${occQuoteCnt}, occT=${occTradeCnt}, option_ts=${optionTsCnt}`
+//       );
+//       try { es.close(); } catch {}
+//       setTimeout(() => startQuoteStream(uniq), 1500);
+//     };
+//   } catch (e) {
+//     console.error("startQuoteStream error:", errToJson(e));
+//   }
+// }
+/* ------------------------ streaming quotes (robust JS) ------------------------ */
+var esQuotes = null;
+
+function startQuoteStream(symbolsOrOCC = []) {
+  try {
+    if (esQuotes) esQuotes.close();
+    const uniq = [...new Set(symbolsOrOCC)].filter(Boolean);
+    if (uniq.length === 0) return;
+
+    const url = `${TRADIER_BASE}/markets/events?symbols=${encodeURIComponent(
+      uniq.join(",")
+    )}&sessionid=${Date.now()}`;
+    const es = new EventSource(url, { headers: H_SSE() });
+    esQuotes = es;
+
+    // --- DEBUG counters ---
+    let qCnt = 0, tCnt = 0, occQuoteCnt = 0, occTradeCnt = 0, optionTsCnt = 0;
+
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+
+        // increment counters (no ++(ternary))
+        if (msg && msg.type === "quote") qCnt++;
+        else if (msg && msg.type === "trade") tCnt++;
+        else qCnt++;
+
+        // sample log every 200th message of that type
+        const cur = msg && msg.type === "quote" ? qCnt : msg && msg.type === "trade" ? tCnt : qCnt;
+        if (msg && msg.type && cur % 200 === 1) {
+          console.log(`[SSE ${msg.type}] sample`, (msg.data && (msg.data.symbol || msg.symbol)) || "", { qCnt, tCnt });
+        }
+
+        // ================== TRADE path ==================
+        if (msg && msg.type === "trade" && msg.data) {
+          const tr = msg.data;
+          const sym = tr.symbol;
+          const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(sym);
+          if (isOCC) occTradeCnt++;
+
+          const price = Number(tr.price ?? tr.last ?? tr.p ?? 0);
+          const qty   = Number(tr.size ?? tr.s ?? tr.quantity ?? tr.last_size ?? 0);
+
+          // refresh NBBO cache if bid/ask present
+          if (tr.bid != null || tr.ask != null) updateMidFromQuote(tr);
+
+          if (isOCC && price > 0 && qty > 0) {
+            const sideInfo = inferSideServer(sym, price);
+            const book = midBySym.get(sym) || {};
+            const eps = epsFor(book);
+            let at = "between";
+            if (book.ask && price >= book.ask - eps) at = "ask";
+            else if (book.bid && price <= book.bid + eps) at = "bid";
+            else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
+
+            // update rolling volume for action heuristic
+            const seenVol = Number(tr.volume ?? NaN);
+            let priorVol = volByOcc.has(sym) ? volByOcc.get(sym) : 0;
+            if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - qty);
+            if (Number.isFinite(seenVol)) volByOcc.set(sym, seenVol);
+            else volByOcc.set(sym, (volByOcc.get(sym) || 0) + qty);
+            const oi = oiByOcc.get(sym) ?? null;
+
+            const ac = classifyOpenClose({
+              qty,
+              oi,
+              priorVol,
+              side: sideInfo.side,
+              at,
+            });
+
+            optionTsCnt++;
+            if (optionTsCnt % 100 === 1) {
+              console.log("[SRV option_ts TRADE]", sym, { qty, price, side: sideInfo.side, at, action: ac.action, priorVol, oi });
+            }
+
+            broadcast({
+              type: "option_ts",
+              symbol: sym,
+              provider: "tradier",
+              data: {
+                id: `ots_${sym}_${tr.trade_time || Date.now()}`,
+                ts: Date.now(),
+                option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(sym) ? "C" : "P" },
+                qty,
+                price,
+                side: sideInfo.side,
+                side_src: sideInfo.side_src,
+                oi,
+                priorVol,
+                book,
+                at,
+                action: ac.action,
+                action_conf: ac.action_conf,
+              },
+            });
+            return;
+          }
+          // non-OCC trades: let quotes path handle equities context if needed
+        }
+
+        // ================== QUOTE path ==================
+        if (msg && msg.type === "quote" && msg.data) {
+          const q = msg.data;
+
+          // always refresh NBBO cache when bid/ask present
+          if (q.bid != null || q.ask != null) updateMidFromQuote(q);
+
+          const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol);
+          if (isOCC) occQuoteCnt++;
+
+          // trade-like data sometimes rides on quote frames
+          const price = Number(q.last ?? q.price ?? q.p ?? 0);
+          const qty   = Number(q.size ?? q.trade_size ?? q.last_size ?? q.quantity ?? 0);
+
+          if (price > 0 && qty > 0) {
+            // broadcast quotes frame (equity prints + side on root)
+            const rootSym = isOCC ? q.symbol.replace(/\d{6}[CP]\d{8}$/, "") : q.symbol;
+            const sideInfoRoot = inferSideServer(rootSym, price);
+            broadcast({ type: "quotes", data: q, side: sideInfoRoot.side, side_src: sideInfoRoot.side_src, provider: "tradier" });
+
+            if (isOCC) {
+              const sideInfo = inferSideServer(q.symbol, price);
+              const book = midBySym.get(q.symbol) || {};
+              const eps = epsFor(book);
+              let at = "between";
+              if (book.ask && price >= book.ask - eps) at = "ask";
+              else if (book.bid && price <= book.bid + eps) at = "bid";
+              else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
+
+              const seenVol = Number(q.volume ?? NaN);
+              let priorVol = volByOcc.has(q.symbol) ? volByOcc.get(q.symbol) : 0;
+              if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - qty);
+              if (Number.isFinite(seenVol)) volByOcc.set(q.symbol, seenVol);
+              else volByOcc.set(q.symbol, (volByOcc.get(q.symbol) || 0) + qty);
+              const oi = oiByOcc.get(q.symbol) ?? null;
+
+              const ac = classifyOpenClose({
+                qty,
+                oi,
+                priorVol,
+                side: sideInfo.side,
+                at,
+              });
+
+              optionTsCnt++;
+              if (optionTsCnt % 100 === 1) {
+                console.log("[SRV option_ts QUOTE]", q.symbol, { qty, price, side: sideInfo.side, at, action: ac.action, priorVol, oi });
+              }
+
+              broadcast({
+                type: "option_ts",
+                symbol: q.symbol,
+                provider: "tradier",
+                data: {
+                  id: `ots_${q.symbol}_${q.trade_time || Date.now()}`,
+                  ts: Date.now(),
+                  option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(q.symbol) ? "C" : "P" },
+                  qty,
+                  price,
+                  side: sideInfo.side,
+                  side_src: sideInfo.side_src,
+                  oi,
+                  priorVol,
+                  book,
+                  at,
+                  action: ac.action,
+                  action_conf: ac.action_conf,
+                },
+              });
+              return;
+            }
+
+            // non-OCC trade-like quote already broadcast above as "quotes"
+          } else {
+            // NBBO-only refresh
+            broadcast({ type: "quotes", data: q, provider: "tradier" });
+          }
+
+          return;
+        }
+      } catch (err) {
+        console.warn("[SSE parse error]", err);
+      }
+    };
+
+    es.onerror = () => {
+      console.warn(
+        `[SSE error] restarting. totals: quote=${qCnt}, trade=${tCnt}, occQ=${occQuoteCnt}, occT=${occTradeCnt}, option_ts=${optionTsCnt}`
+      );
+      try { es.close(); } catch {}
+      setTimeout(() => startQuoteStream(uniq), 1500);
+    };
+  } catch (e) {
+    console.error("startQuoteStream error:", errToJson(e));
+  }
+}
+
 let esQuotes = null;
 function startQuoteStream(symbolsOrOCC=[]) {
   try {
