@@ -7,7 +7,7 @@ if (!POLYGON_KEY) {
   console.warn("[polygon] POLYGON_KEY is not set; polygon provider will error on use.");
 }
 
-const POLY = axios.create({
+export const POLY = axios.create({
   baseURL: "https://api.polygon.io",
   headers: { Authorization: `Bearer ${POLYGON_KEY}` },
   timeout: 15000,
