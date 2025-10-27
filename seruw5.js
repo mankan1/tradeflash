@@ -90,10 +90,12 @@ const PORT1 = process.env.PORT || 10000
 //   clientTracking: true
 // });
 
-const wss = new WebSocketServer({ 
-  server,  // Remove path: '/ws'
-  perMessageDeflate: false,
-  clientTracking: true
+// 2) WS attached to SAME server + explicit path
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",              // <— explicit path prevents ambiguity
+  clientTracking: true,
+  perMessageDeflate: false, // friendlier behind proxies
 });
 
 // WebSocket connections
@@ -106,6 +108,14 @@ wss.on('connection', (ws) => {
   })
 })
 
+// 4) keep-alive (important behind proxies)
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) { try { ws.terminate(); } catch {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30000);
 
 //const wss = new WebSocketServer({ server, path: "/ws" }); //({ port: Number(WS_PORT) });
 
