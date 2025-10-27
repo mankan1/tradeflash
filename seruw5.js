@@ -26,7 +26,11 @@ attachAxiosLogging(axios, "tradier");      // your default axios (Tradier usage)
 export const reqStore = new AsyncLocalStorage();
 
 const app = express();
-app.use(cors());
+// app.use(cors());
+app.use(cors({
+  origin: '*', // Allow all origins, or specify: 'https://tradeflashcli.vercel.app'
+  credentials: true
+}));
 
 // Important: Add CORS and headers
 app.use((req, res, next) => {
@@ -86,7 +90,11 @@ const PORT1 = process.env.PORT || 10000
 //   clientTracking: true
 // });
 
-const wss = new WebSocketServer({ server, path: '/ws' })
+const wss = new WebSocketServer({ 
+  server,  // Remove path: '/ws'
+  perMessageDeflate: false,
+  clientTracking: true
+});
 
 // WebSocket connections
 wss.on('connection', (ws) => {
@@ -199,6 +207,18 @@ function classifyOpenClose({ qty, oi, priorVol, side, at }) {
     return { action: "CLOSE?", action_conf: "low" };
   }
   return { action: "—", action_conf: "low" };
+}
+async function polyTopMovers() {
+  // /v2/snapshot/locale/us/markets/stocks/gainers | losers
+  const [g, l] = await Promise.all([
+    POLY.get("/v2/snapshot/locale/us/markets/stocks/gainers"),
+    POLY.get("/v2/snapshot/locale/us/markets/stocks/losers"),
+  ]);
+  // Each row has: ticker, day, lastTrade, min, prevDay, etc.
+  return {
+    gainers: Array.isArray(g.data?.tickers) ? g.data.tickers : [],
+    losers:  Array.isArray(l.data?.tickers) ? l.data.tickers : [],
+  };
 }
 async function polyMostActives({ by="volume", top=30 } = {}) {
   // /v2/snapshot/locale/us/markets/stocks/tickers
