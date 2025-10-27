@@ -72,7 +72,8 @@ if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 const server = http.createServer(app);
 
 // const WebSocket = require('ws')
-// const PORT = process.env.PORT || 3000;
+// const PORT1 = process.env.PORT || 3000;
+const PORT1 = process.env.PORT || 10000
 
 //const wss = new WebSocket.Server({ server })
 
@@ -1181,8 +1182,8 @@ app.post("/settings/credentials", async (req, res) => {
   }
 });
 /* ------------------------ boot ------------------------ */
-app.listen(Number(PORT), () => {
-  console.log(`HTTP on ${PORT} | WS on ${WS_PORT}`);
+app.listen(Number(PORT1), () => {
+  console.log(`HTTP on ${PORT1} | WS on ${WS_PORT}`);
   console.log(`Try: curl "http://localhost:${PORT}/scan?limit=15"`);
   console.log(`Try: curl "http://localhost:${PORT}/watch?symbols=NVDA&eqForTS=NVDA&backfill=10"`);
 });
