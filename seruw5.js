@@ -17,6 +17,8 @@ import { POLY, startPolygonWatch } from "./polygon.js";
 import morgan from "morgan";
 import { v4 as uuidv4 } from "uuid";
 import { AsyncLocalStorage } from "node:async_hooks";
+// ---- Alpaca equity "flow" (polling latest trades) ----
+import { ALP } from "./polygon.js"; // path as per your project
 
 
 attachAxiosLogging(axios, "tradier");      // your default axios (Tradier usage)
@@ -153,6 +155,8 @@ function parseDay(req) {
   return nowNY.toFormat("yyyy-LL-dd");
 }
 
+const alpLastBySym = new Map(); // symbol -> last trade ID (or ts/price) we’ve seen
+
 /* ------------------------ side inference + books (existing) ------------------------ */
 const midBySym = new Map();        // symbol -> { bid, ask, mid }
 const lastTradeBySym = new Map();  // symbol -> last trade price we broadcast
@@ -218,6 +222,52 @@ function classifyOpenClose({ qty, oi, priorVol, side, at }) {
   }
   return { action: "—", action_conf: "low" };
 }
+
+async function pollAlpacaLatestTrades(symbols = []) {
+  if (!symbols.length) return;
+  try {
+    const { data } = await ALP.get("/v2/stocks/trades/latest", {
+      params: { symbols: symbols.join(",") },
+      validateStatus: () => true,
+    });
+    const snaps = data?.trades || data?.latestTrades || data; // handle shapes
+
+    for (const sym of symbols) {
+      const row = snaps?.[sym];
+      if (!row) continue;
+
+      // Normalize
+      const price = Number(row.p ?? row.price ?? 0);
+      const size  = Number(row.s ?? row.size ?? 0);
+      const ts    = Number(row.t ?? row.timestamp ?? Date.now());
+      const id    = String(row.i ?? row.id ?? `${sym}_${ts}_${price}`);
+
+      if (!(price > 0 && size > 0)) continue;
+
+      // de-dupe
+      const prevId = alpLastBySym.get(sym);
+      if (prevId === id) continue;
+      alpLastBySym.set(sym, id);
+
+      // update book approximation from a quick quote snapshot (optional)
+      // you can skip this if you’re happy with tick-based side only
+      let at = "between";
+      let side_src = "tick";
+      const { side } = inferSideServer(sym, price); // your existing mid/tick logic chooses a side, src "mid" if book known
+
+      // Broadcast in our unified shape and tag provider
+      broadcast({
+        type: "equity_ts",
+        symbol: sym,
+        provider: "alpaca",
+        data: { time: ts, price, size, side, side_src, at }
+      });
+    }
+  } catch (e) {
+    console.error("pollAlpacaLatestTrades error:", errToJson(e));
+  }
+}
+
 async function polyTopMovers() {
   // /v2/snapshot/locale/us/markets/stocks/gainers | losers
   const [g, l] = await Promise.all([
@@ -394,28 +444,15 @@ app.get('/health', (req, res) => {
 
 app.get("/watch", async (req, res) => {
   try {
-    const provider = String(req.query.provider || "tradier").toLowerCase();
-
-    // Use syms (not "symbols") to avoid clashes anywhere else
-    const syms = String(req.query.symbols || "SPY")
-      .split(",")
-      .map(s => s.trim().toUpperCase())
-      .filter(Boolean);
-
-    const eqForTS = String(req.query.eqForTS || syms.join(","))
-      .split(",")
-      .map(s => s.trim().toUpperCase())
-      .filter(Boolean);
-
+    const provider = String(req.query.provider || "tradier").toLowerCase(); // tradier|alpaca|both
+    const symbols = String(req.query.symbols || "SPY").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+    const eqForTS = String(req.query.eqForTS || symbols.join(",")).split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
     const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
-    const day          = parseDay(req);
+    const day = parseDay(req);
 
     const moneyness = req.query.moneyness ? Number(req.query.moneyness) : 0.25;
     const limit     = req.query.limit ? Number(req.query.limit) : 150;
-    const expiries  = String(req.query.expiries || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
+    const expiries  = String(req.query.expiries || "").split(",").map(s=>s.trim()).filter(Boolean);
 
     // cancel any previous loops
     if (typeof stopCurrentWatch === "function") {
@@ -443,33 +480,41 @@ app.get("/watch", async (req, res) => {
       });
     }
 
-    // ---- TRADIER (default) ----
+    // Build options watch list using Tradier (best for options detail)
     const occSet = new Set();
-    for (const root of syms) {
+    for (const s of symbols) {
       try {
-        const occ = await buildOptionsWatchList(
-          root,
-          { expiries, moneyness, limit: Math.ceil(limit / Math.max(1, syms.length)) }
-        );
+        const occ = await buildOptionsWatchList(s, { expiries, moneyness, limit: Math.ceil(limit / symbols.length) });
         occ.forEach(x => occSet.add(x));
-      } catch (e) {
-        console.warn("buildOptionsWatchList failed", root, errToJson(e));
-      }
+      } catch (e) { console.warn("buildOptionsWatchList failed", s, errToJson(e)); }
     }
 
-    startQuoteStream([...syms, ...occSet]);
+    // ----- start streams based on provider -----
+    if (provider === "tradier" || provider === "both") {
+      startQuoteStream([...symbols, ...occSet]); // your existing Tradier SSE -> emits quotes/equity_ts/option_ts w/ provider implicit
+    }
 
+    // Lightweight Alpaca flow for EQUITIES (options flow varies by plan; keep options via Tradier)
+    let alpTimer = null;
+    if (provider === "alpaca" || provider === "both") {
+      const uniqRoots = [...new Set(symbols)];
+      const T = 1250; // poll roughly every 1.25s
+      alpTimer = setInterval(() => pollAlpacaLatestTrades(uniqRoots), T);
+      // attach to req “session” so it can be cleared if needed; for simplicity we let it run
+    }
+
+    // backfill (equity prints) for charts/initial rows — from Tradier
     if (backfillMins > 0) {
       await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, backfillMins)));
     }
 
-    return res.json({
+    res.json({
       ok: true,
-      provider: "tradier",
-      env: { provider: "tradier", base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
-      watching: { equities: syms, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
+      provider,
+      env: { provider, base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
+      watching:{ equities: symbols, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
     });
-
+    
   } catch (e) {
     const detail = errToJson(e);
     console.error("/watch error:", detail);

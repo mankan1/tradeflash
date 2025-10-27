@@ -6,6 +6,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
 export const reqStore = new AsyncLocalStorage();
 
 
+const { APCA_API_KEY_ID, APCA_API_SECRET_KEY } = process.env; // re-use same env if you prefer
+// If you want a separate POLYGON_KEY, keep your existing Polygon client too.
+
+
+export const ALP = axios.create({
+  baseURL: "https://data.alpaca.markets",
+  headers: {
+    "Apca-Api-Key-Id": APCA_API_KEY_ID || "",
+    "Apca-Api-Secret-Key": APCA_API_SECRET_KEY || ""
+  },
+  timeout: 15000,
+});
+
 // --- ENV & axios ---
 const { POLYGON_KEY = "" } = process.env;
 if (!POLYGON_KEY) {
