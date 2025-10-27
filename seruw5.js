@@ -896,79 +896,279 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
+// app.get("/watch", async (req, res) => {
+//   try {
+//     const provider = String(req.query.provider || "tradier").toLowerCase(); // tradier|alpaca|both
+//     const symbols = String(req.query.symbols || "SPY").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+//     const eqForTS = String(req.query.eqForTS || symbols.join(",")).split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+//     const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
+//     const day = parseDay(req);
+
+//     const moneyness = req.query.moneyness ? Number(req.query.moneyness) : 0.25;
+//     const limit     = req.query.limit ? Number(req.query.limit) : 150;
+//     const expiries  = String(req.query.expiries || "").split(",").map(s=>s.trim()).filter(Boolean);
+
+//     // cancel any previous loops
+//     if (typeof stopCurrentWatch === "function") {
+//       try { stopCurrentWatch(); } catch {}
+//       stopCurrentWatch = null;
+//     }
+
+//     console.log(`[watch] provider=${provider} syms=${symbols.join(",")} eqForTS=${eqForTS.join(",")} backfill=${backfillMins} mny=${moneyness} limit=${limit}`);
+
+//     if (provider === "polygon") {
+//       // start polygon polling loops
+//       stopCurrentWatch = await startPolygonWatch({
+//         equities: symbols,
+//         moneyness,
+//         limit,
+//         broadcast,
+//         classifyOptionAction: classifyOpenClose,
+//       });
+
+//       return res.json({
+//         ok: true,
+//         provider: "polygon",
+//         env: { provider: "polygon", base: "https://api.polygon.io", delayed: true },
+//         watching: { equities: symbols, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
+//       });
+//     }
+
+//     // Build options watch list using Tradier (best for options detail)
+//     const occSet = new Set();
+//     for (const s of symbols) {
+//       try {
+//         const occ = await buildOptionsWatchList(s, { expiries, moneyness, limit: Math.ceil(limit / symbols.length) });
+//         occ.forEach(x => occSet.add(x));
+//       } catch (e) { console.warn("buildOptionsWatchList failed", s, errToJson(e)); }
+//     }
+
+//     // ----- start streams based on provider -----
+//     if (provider === "tradier" || provider === "both") {
+//       startQuoteStream([...symbols, ...occSet]); // your existing Tradier SSE -> emits quotes/equity_ts/option_ts w/ provider implicit
+//     }
+
+//     // Lightweight Alpaca flow for EQUITIES (options flow varies by plan; keep options via Tradier)
+//     let alpTimer = null;
+//     if (provider === "alpaca" || provider === "both") {
+//       const uniqRoots = [...new Set(symbols)];
+//       const T = 1250; // poll roughly every 1.25s
+//       alpTimer = setInterval(() => pollAlpacaLatestTrades(uniqRoots), T);
+//       // attach to req “session” so it can be cleared if needed; for simplicity we let it run
+//     }
+
+//     // backfill (equity prints) for charts/initial rows — from Tradier
+//     if (backfillMins > 0) {
+//       await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, backfillMins)));
+//     }
+
+//     res.json({
+//       ok: true,
+//       provider,
+//       env: { provider, base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
+//       watching:{ equities: symbols, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
+//     });
+    
+//   } catch (e) {
+//     const detail = errToJson(e);
+//     console.error("/watch error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
+// --- Market-hours helper (New York time, regular session only) ---
+function isMarketOpenNY() {
+  const now = DateTime.now().setZone("America/New_York");
+  if (now.weekday === 6 || now.weekday === 7) return false; // Sat/Sun
+  const mins = now.hour * 60 + now.minute;
+  return mins >= (9 * 60 + 30) && mins < (16 * 60); // 09:30–16:00 ET
+}
+
+// --- Historical equity ticks (Tradier timesales) ---
+async function getEquityTimesales(symbol, dayISO, minutes) {
+  try {
+    const start = DateTime.fromISO(dayISO + "T09:30:00", { zone: "America/New_York" });
+    const end   = start.plus({ minutes: Math.max(1, Number(minutes) || 5) });
+
+    const params = {
+      symbol,
+      interval: TS_INTERVAL, // your existing: "tick" (prod) or "1min" (sandbox)
+      start: start.toFormat("yyyy-LL-dd HH:mm:ss"),
+      end:   end.toFormat("yyyy-LL-dd HH:mm:ss"),
+    };
+
+    const { data } = await axios.get(`${TRADIER_BASE}/markets/timesales`, {
+      headers: H_JSON(), params
+    });
+
+    const arr = (data && data.series && data.series.data) ? data.series.data : [];
+    return arr.map(t => ({
+      time:  t.time,                                                     // 'YYYY-MM-DD HH:mm:ss'
+      price: Number(t.price ?? t.last ?? t.close ?? 0),
+      size:  Number(t.size ?? t.volume ?? t.qty ?? t.quantity ?? 0),
+      bid:   Number.isFinite(+t.bid) ? +t.bid : undefined,
+      ask:   Number.isFinite(+t.ask) ? +t.ask : undefined,
+    })).filter(r => r.price > 0 && r.size > 0);
+  } catch (e) {
+    console.error("getEquityTimesales error:", errToJson(e));
+    return [];
+  }
+}
+
+// --- Replay equity ticks as if live (drip frames out) ---
+function replayEquityTimesales(symbol, rows, speedMs) {
+  const pace = Math.max(10, Number(speedMs) || 100); // default 100ms per print
+  let i = 0;
+
+  const tick = () => {
+    if (i >= rows.length) return;
+    const r = rows[i++];
+
+    // existing book/tick side logic
+    const sidePack = inferSideServer(symbol, r.price);
+    lastTradeBySym.set(symbol, r.price);
+
+    const book = midBySym.get(symbol) || {};
+    const eps  = epsFor(book);
+    let at = "between";
+    if (book.ask && r.price >= book.ask - eps) at = "ask";
+    else if (book.bid && r.price <= book.bid + eps) at = "bid";
+    else if (book.mid && Math.abs(r.price - book.mid) <= eps) at = "mid";
+
+    broadcast({
+      type: "equity_ts",
+      symbol,
+      data: {
+        time: r.time,
+        price: r.price,
+        size: r.size,
+        bid: r.bid,
+        ask: r.ask,
+        side: sidePack.side,
+        side_src: sidePack.side_src,
+        at,
+      }
+    });
+
+    setTimeout(tick, pace);
+  };
+
+  tick();
+}
 app.get("/watch", async (req, res) => {
   try {
-    const provider = String(req.query.provider || "tradier").toLowerCase(); // tradier|alpaca|both
-    const symbols = String(req.query.symbols || "SPY").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
-    const eqForTS = String(req.query.eqForTS || symbols.join(",")).split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
-    const backfillMins = req.query.backfill ? Number(req.query.backfill) : 5;
-    const day = parseDay(req);
+    const provider = String(req.query.provider || "tradier").toLowerCase();
 
-    const moneyness = req.query.moneyness ? Number(req.query.moneyness) : 0.25;
-    const limit     = req.query.limit ? Number(req.query.limit) : 150;
-    const expiries  = String(req.query.expiries || "").split(",").map(s=>s.trim()).filter(Boolean);
+    const symbols = String(req.query.symbols || "SPY")
+      .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
 
-    // cancel any previous loops
+    const eqForTS = String(req.query.eqForTS || symbols.join(","))
+      .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+    // Trading day to use (defaults to your parseDay, which handles weekends)
+    const day = (req.query.day && /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day)))
+      ? String(req.query.day)
+      : parseDay(req);
+
+    // --- Smart defaults for live/replay ---
+    let live   = req.query.live === "0" ? 0 : (req.query.live === "1" ? 1 : null);
+    let replay = req.query.replay === "1" ? 1 : (req.query.replay === "0" ? 0 : null);
+
+    if (live === null && replay === null) {
+      live = isMarketOpenNY() ? 1 : 0;
+      replay = live ? 0 : 1;
+    }
+
+    // minutes/backfill tuned by mode
+    const minutes = req.query.minutes ? Number(req.query.minutes)
+                  : (live ? 0 : 390);
+    const backfillMins = req.query.backfill ? Number(req.query.backfill)
+                       : (live ? 10 : 0);
+
+    const moneyness = Number(req.query.moneyness || 0.25);
+    const limit     = Number(req.query.limit     || 150);
+    const expiries  = String(req.query.expiries || "")
+                        .split(",").map(s => s.trim()).filter(Boolean);
+
+    // stop prior watchers
     if (typeof stopCurrentWatch === "function") {
       try { stopCurrentWatch(); } catch {}
       stopCurrentWatch = null;
     }
 
-    console.log(`[watch] provider=${provider} syms=${symbols.join(",")} eqForTS=${eqForTS.join(",")} backfill=${backfillMins} mny=${moneyness} limit=${limit}`);
-
-    if (provider === "polygon") {
-      // start polygon polling loops
-      stopCurrentWatch = await startPolygonWatch({
-        equities: symbols,
-        moneyness,
-        limit,
-        broadcast,
-        classifyOptionAction: classifyOpenClose,
-      });
-
-      return res.json({
-        ok: true,
-        provider: "polygon",
-        env: { provider: "polygon", base: "https://api.polygon.io", delayed: true },
-        watching: { equities: symbols, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
-      });
-    }
-
-    // Build options watch list using Tradier (best for options detail)
+    // ---- Build OCC set (options universe) using your existing helper ----
     const occSet = new Set();
     for (const s of symbols) {
       try {
-        const occ = await buildOptionsWatchList(s, { expiries, moneyness, limit: Math.ceil(limit / symbols.length) });
+        const occ = await buildOptionsWatchList(
+          s,
+          { expiries, moneyness, limit: Math.ceil(limit / Math.max(1, symbols.length)) }
+        );
         occ.forEach(x => occSet.add(x));
-      } catch (e) { console.warn("buildOptionsWatchList failed", s, errToJson(e)); }
+      } catch (e) {
+        console.warn("buildOptionsWatchList failed", s, errToJson(e));
+      }
     }
 
-    // ----- start streams based on provider -----
-    if (provider === "tradier" || provider === "both") {
-      startQuoteStream([...symbols, ...occSet]); // your existing Tradier SSE -> emits quotes/equity_ts/option_ts w/ provider implicit
-    }
-
-    // Lightweight Alpaca flow for EQUITIES (options flow varies by plan; keep options via Tradier)
-    let alpTimer = null;
-    if (provider === "alpaca" || provider === "both") {
-      const uniqRoots = [...new Set(symbols)];
-      const T = 1250; // poll roughly every 1.25s
-      alpTimer = setInterval(() => pollAlpacaLatestTrades(uniqRoots), T);
-      // attach to req “session” so it can be cleared if needed; for simplicity we let it run
-    }
-
-    // backfill (equity prints) for charts/initial rows — from Tradier
-    if (backfillMins > 0) {
+    // ---- EQUITIES: replay/backfill for selected session ----
+    if (!live && minutes > 0) {
+      for (const sym of eqForTS) {
+        const rows = await getEquityTimesales(sym, day, minutes);
+        // drip them out like a tape (speed param optional)
+        const speedMs = Number(req.query.speed || 60);
+        replayEquityTimesales(sym, rows, speedMs);
+      }
+    } else if (live && backfillMins > 0) {
       await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, backfillMins)));
     }
 
-    res.json({
+    // ---- OPTIONS: optional light seeding off-hours so UI isn’t empty ----
+    if (!live) {
+      for (const occ of Array.from(occSet).slice(0, 100)) {
+        const book = midBySym.get(occ) || {};
+        const px = Number.isFinite(book.mid) ? book.mid : (book.ask ?? book.bid ?? 0);
+        if (!(px > 0)) continue;
+        const sidePack = inferSideServer(occ, px);
+        const oi = oiByOcc.get(occ) ?? null;
+        const priorVol = volByOcc.get(occ) ?? 0;
+
+        broadcast({
+          type: "option_ts",
+          symbol: occ,
+          data: {
+            id: `ots_${occ}_${day}`,
+            ts: Date.now(),
+            option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(occ) ? "C" : "P" },
+            qty: 1, price: px,
+            side: sidePack.side, side_src: sidePack.side_src,
+            oi, priorVol, book, at: "between",
+            action: "—", action_conf: "low"
+          }
+        });
+      }
+    }
+
+    // ---- Live streaming path (unchanged) ----
+    if (live) {
+      if (provider === "polygon") {
+        stopCurrentWatch = await startPolygonWatch({
+          equities: symbols,
+          moneyness,
+          limit,
+          broadcast,
+          classifyOptionAction: classifyOpenClose,
+        });
+      } else {
+        // Tradier SSE (quotes -> equity_ts/option_ts via your current logic)
+        startQuoteStream([ ...symbols, ...occSet ]);
+      }
+    }
+
+    return res.json({
       ok: true,
       provider,
       env: { provider, base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
-      watching:{ equities: symbols, options_count: occSet.size, eqForTS, day, backfillMins, limit, moneyness }
+      watching: { equities: symbols, options_count: occSet.size, eqForTS, day, minutes, backfillMins, live, replay, limit, moneyness }
     });
-    
   } catch (e) {
     const detail = errToJson(e);
     console.error("/watch error:", detail);
