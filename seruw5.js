@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { WebSocketServer } from "ws";
+
+import { WebSocketServer } from 'ws';
 import * as ES from "eventsource"; const EventSource = ES.default ?? ES;
 import axios from "axios";
 import { DateTime } from "luxon";
@@ -68,12 +70,13 @@ if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 
 const server = http.createServer(app);
 
-const WebSocket = require('ws')
+// const WebSocket = require('ws')
 // const PORT = process.env.PORT || 3000;
 
 //const wss = new WebSocket.Server({ server })
 
 // Create WebSocket server with proper config
+
 const wss = new WebSocket.Server({ 
   server,
   perMessageDeflate: false, // Important for Render
