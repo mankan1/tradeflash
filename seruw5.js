@@ -67,7 +67,7 @@ if (!TRADIER_BASE || !TRADIER_TOKEN) throw new Error("Missing TRADIER_* envs");
 const server = http.createServer(app);
 
 const WebSocket = require('ws')
-const PORT = process.env.PORT || 3000;
+// const PORT = process.env.PORT || 3000;
 
 //const wss = new WebSocket.Server({ server })
 
