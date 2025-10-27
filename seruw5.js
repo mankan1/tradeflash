@@ -460,12 +460,12 @@ app.get("/watch", async (req, res) => {
       stopCurrentWatch = null;
     }
 
-    console.log(`[watch] provider=${provider} syms=${syms.join(",")} eqForTS=${eqForTS.join(",")} backfill=${backfillMins} mny=${moneyness} limit=${limit}`);
+    console.log(`[watch] provider=${provider} syms=${symbols.join(",")} eqForTS=${eqForTS.join(",")} backfill=${backfillMins} mny=${moneyness} limit=${limit}`);
 
     if (provider === "polygon") {
       // start polygon polling loops
       stopCurrentWatch = await startPolygonWatch({
-        equities: syms,
+        equities: symbols,
         moneyness,
         limit,
         broadcast,
@@ -476,7 +476,7 @@ app.get("/watch", async (req, res) => {
         ok: true,
         provider: "polygon",
         env: { provider: "polygon", base: "https://api.polygon.io", delayed: true },
-        watching: { equities: syms, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
+        watching: { equities: symbols, eqForTS, day, backfillMins, limit, moneyness, options_count: 0 }
       });
     }
 
