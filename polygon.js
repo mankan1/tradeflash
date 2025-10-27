@@ -1,5 +1,10 @@
 // server/providers/polygon.js
 import axios from "axios";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+
+export const reqStore = new AsyncLocalStorage();
+
 
 // --- ENV & axios ---
 const { POLYGON_KEY = "" } = process.env;
