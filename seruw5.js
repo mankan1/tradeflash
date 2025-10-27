@@ -35,28 +35,60 @@ const app = express();
 // }));
 
 // allow your local dev + your deployed web app(s)
-const ALLOW_ORIGINS = [
-  "http://localhost:8081",          // your local expo web/serve port
-  "http://localhost:19006",         // expo default web dev port (if used)
-  "https://tradeflashcli.vercel.app", // your Vercel client
-  // add any others you actually use
+// const ALLOW_ORIGINS = [
+//   "http://localhost:8081",          // your local expo web/serve port
+//   "http://localhost:19006",         // expo default web dev port (if used)
+//   "https://tradeflashcli.vercel.app", // your Vercel client
+//   // add any others you actually use
+// ];
+
+// app.use(
+//   cors({
+//     origin: function (origin, cb) {
+//       // allow no-origin (curl, health checks) and exact matches
+//       if (!origin || ALLOW_ORIGINS.includes(origin)) return cb(null, true);
+//       return cb(new Error("CORS: origin not allowed: " + origin), false);
+//     },
+//     methods: ["GET", "POST", "OPTIONS"],
+//     allowedHeaders: ["Content-Type", "x-request-id", "x-requested-with"],
+//     credentials: false, // keep false unless you really need cookies/auth
+//   })
+// );
+
+// // Good practice: handle preflight explicitly
+// app.options("*", cors());
+
+const ORIGINS = [
+  "https://tradeflash.pro",
+  "https://tradeflashcli.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://localhost:8080",
 ];
+
+app.use((req, res, next) => {
+  // help caches pick correct variant per Origin
+  res.header("Vary", "Origin");
+  next();
+});
 
 app.use(
   cors({
-    origin: function (origin, cb) {
-      // allow no-origin (curl, health checks) and exact matches
-      if (!origin || ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS: origin not allowed: " + origin), false);
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);                 // curl / server-to-server
+      if (ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS: origin not allowed: ${origin}`));
     },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-request-id", "x-requested-with"],
-    credentials: false, // keep false unless you really need cookies/auth
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-request-id"],
+    credentials: false, // set to true only if you really need cookies/auth
+    maxAge: 86400,
   })
 );
 
-// Good practice: handle preflight explicitly
+// reply to preflight
 app.options("*", cors());
+
 // Important: Add CORS and headers
 // app.use((req, res, next) => {
 //   res.header('Access-Control-Allow-Origin', '*');
