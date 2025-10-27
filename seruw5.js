@@ -90,65 +90,29 @@ const PORT1 = process.env.PORT || 10000
 //   clientTracking: true
 // });
 
-// const wss = new WebSocketServer({ 
-//   server,  // Remove path: '/ws'
-//   perMessageDeflate: false,
-//   clientTracking: true
-// });
-
-// const wss = new WebSocket.Server({ noServer: true });
-
-const wss = new WebSocketServer({ noServer: true, clientTracking: true, perMessageDeflate: false });
-
-server.on("upgrade", (req, socket, head) => {
-  const { pathname } = parseUrl(req.url || "/");
-  if (pathname !== "/ws") { socket.destroy(); return; }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+const wss = new WebSocketServer({ 
+  server,  // Remove path: '/ws'
+  perMessageDeflate: false,
+  clientTracking: true
 });
-
-function safeSend(ws, obj) {
-  if (ws.readyState !== WebSocket.OPEN) return false;
-  if (ws.bufferedAmount > 1_000_000) return false;
-  try { ws.send(JSON.stringify(obj)); return true; }
-  catch { try { ws.terminate(); } catch {} return false; }
-}
-
-function broadcast(msg) {
-  for (const ws of wss.clients) safeSend(ws, msg);
-}
-
-wss.on("connection", (ws) => {
-  ws.isAlive = true;
-  ws.on("pong", () => (ws.isAlive = true));
-  ws.on("message", (m) => { /* handle messages if needed */ });
-  safeSend(ws, { type: "hello" });
-});
-
-setInterval(() => {
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) { try { ws.terminate(); } catch {} continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  }
-}, 30000);
 
 // WebSocket connections
-// wss.on('connection', (ws) => {
-//   console.log('WebSocket client connected')
+wss.on('connection', (ws) => {
+  console.log('WebSocket client connected')
 
-//   ws.on('message', (message) => {
-//     console.log('Received:', message.toString())
-//     ws.send(`Hello over WebSocket!`)
-//   })
-// })
+  ws.on('message', (message) => {
+    console.log('Received:', message.toString())
+    ws.send(`Hello over WebSocket!`)
+  })
+})
 
 
 //const wss = new WebSocketServer({ server, path: "/ws" }); //({ port: Number(WS_PORT) });
 
-// const broadcast = (msg) => {
-//   const s = JSON.stringify(msg);
-//   for (const c of wss.clients) if (c.readyState === 1) c.send(s);
-// };
+const broadcast = (msg) => {
+  const s = JSON.stringify(msg);
+  for (const c of wss.clients) if (c.readyState === 1) c.send(s);
+};
 
 // const H_JSON = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "application/json" };
 // const H_SSE  = { Authorization: `Bearer ${TRADIER_TOKEN}`, Accept: "text/event-stream" };
