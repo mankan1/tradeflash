@@ -76,7 +76,8 @@ const server = http.createServer(app);
 
 // Create WebSocket server with proper config
 
-const wss = new WebSocket.Server({ 
+// const wss = new WebSocket.Server({ 
+const wss = WebSocketServer({ 
   server,
   perMessageDeflate: false, // Important for Render
   clientTracking: true
