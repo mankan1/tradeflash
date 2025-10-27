@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { WebSocketServer } from "ws";
 
 import { WebSocketServer } from 'ws';
 import * as ES from "eventsource"; const EventSource = ES.default ?? ES;
