@@ -29,17 +29,40 @@ export const reqStore = new AsyncLocalStorage();
 
 const app = express();
 // app.use(cors());
-app.use(cors({
-  origin: '*', // Allow all origins, or specify: 'https://tradeflashcli.vercel.app'
-  credentials: true
-}));
+// app.use(cors({
+//   origin: '*', // Allow all origins, or specify: 'https://tradeflashcli.vercel.app'
+//   credentials: true
+// }));
 
+// allow your local dev + your deployed web app(s)
+const ALLOW_ORIGINS = [
+  "http://localhost:8081",          // your local expo web/serve port
+  "http://localhost:19006",         // expo default web dev port (if used)
+  "https://tradeflashcli.vercel.app", // your Vercel client
+  // add any others you actually use
+];
+
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      // allow no-origin (curl, health checks) and exact matches
+      if (!origin || ALLOW_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS: origin not allowed: " + origin), false);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-request-id", "x-requested-with"],
+    credentials: false, // keep false unless you really need cookies/auth
+  })
+);
+
+// Good practice: handle preflight explicitly
+app.options("*", cors());
 // Important: Add CORS and headers
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  next();
-});
+// app.use((req, res, next) => {
+//   res.header('Access-Control-Allow-Origin', '*');
+//   res.header('Access-Control-Allow-Headers', '*');
+//   next();
+// });
 
 app.use(express.json({ limit: "64kb" }));
 
