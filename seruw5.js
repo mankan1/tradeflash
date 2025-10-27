@@ -1212,7 +1212,7 @@ app.post("/settings/credentials", async (req, res) => {
   }
 });
 /* ------------------------ boot ------------------------ */
-app.listen(Number(PORT1), () => {
+server.listen(Number(PORT1), () => {
   console.log(`HTTP on ${PORT1} | WS on ${WS_PORT}`);
   console.log(`Try: curl "http://localhost:${PORT}/scan?limit=15"`);
   console.log(`Try: curl "http://localhost:${PORT}/watch?symbols=NVDA&eqForTS=NVDA&backfill=10"`);
