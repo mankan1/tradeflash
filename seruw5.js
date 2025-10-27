@@ -791,80 +791,80 @@ function startQuoteStream(symbolsOrOCC = []) {
   }
 }
 
-let esQuotes = null;
-function startQuoteStream(symbolsOrOCC=[]) {
-  try {
-    if (esQuotes) esQuotes.close();
-    const uniq = [...new Set(symbolsOrOCC)].filter(Boolean);
-    if (uniq.length === 0) return;
-    const url = `${TRADIER_BASE}/markets/events?symbols=${encodeURIComponent(uniq.join(","))}&sessionid=${Date.now()}`;
-    const es  = new EventSource(url, { headers: H_SSE() }); esQuotes = es;
+// let esQuotes = null;
+// function startQuoteStream(symbolsOrOCC=[]) {
+//   try {
+//     if (esQuotes) esQuotes.close();
+//     const uniq = [...new Set(symbolsOrOCC)].filter(Boolean);
+//     if (uniq.length === 0) return;
+//     const url = `${TRADIER_BASE}/markets/events?symbols=${encodeURIComponent(uniq.join(","))}&sessionid=${Date.now()}`;
+//     const es  = new EventSource(url, { headers: H_SSE() }); esQuotes = es;
 
-    es.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg?.type === "quote" && msg?.data) {
-          const q = msg.data;
-          updateMidFromQuote(q);
+//     es.onmessage = (e) => {
+//       try {
+//         const msg = JSON.parse(e.data);
+//         if (msg?.type === "quote" && msg?.data) {
+//           const q = msg.data;
+//           updateMidFromQuote(q);
 
-          if (q.last && q.size && q.size > 0) {
-            const rootSym = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol)
-              ? q.symbol.replace(/\d{6}[CP]\d{8}$/, "")
-              : q.symbol;
+//           if (q.last && q.size && q.size > 0) {
+//             const rootSym = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol)
+//               ? q.symbol.replace(/\d{6}[CP]\d{8}$/, "")
+//               : q.symbol;
 
-            const price = Number(q.last);
-            const { side, side_src } = inferSideServer(rootSym, price);
-            lastTradeBySym.set(rootSym, price);
-            broadcast({ type: "quotes", data: q, side, side_src });
+//             const price = Number(q.last);
+//             const { side, side_src } = inferSideServer(rootSym, price);
+//             lastTradeBySym.set(rootSym, price);
+//             broadcast({ type: "quotes", data: q, side, side_src });
 
-            const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol);
-            if (isOCC) {
-              const optSide = inferSideServer(q.symbol, price);
-              const book = midBySym.get(q.symbol) || {};
-              const eps = epsFor(book);
-              let at = "between";
-              if (book.ask && price >= book.ask - eps) at = "ask";
-              else if (book.bid && price <= book.bid + eps) at = "bid";
-              else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
+//             const isOCC = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/i.test(q.symbol);
+//             if (isOCC) {
+//               const optSide = inferSideServer(q.symbol, price);
+//               const book = midBySym.get(q.symbol) || {};
+//               const eps = epsFor(book);
+//               let at = "between";
+//               if (book.ask && price >= book.ask - eps) at = "ask";
+//               else if (book.bid && price <= book.bid + eps) at = "bid";
+//               else if (book.mid && Math.abs(price - book.mid) <= eps) at = "mid";
 
-              const seenVol = Number(q.volume ?? NaN);
-              let priorVol = volByOcc.has(q.symbol) ? volByOcc.get(q.symbol) : 0;
-              if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - Number(q.size));
-              if (Number.isFinite(seenVol)) volByOcc.set(q.symbol, seenVol);
-              else volByOcc.set(q.symbol, (volByOcc.get(q.symbol) || 0) + Number(q.size));
-              const oi = oiByOcc.get(q.symbol) ?? null;
+//               const seenVol = Number(q.volume ?? NaN);
+//               let priorVol = volByOcc.has(q.symbol) ? volByOcc.get(q.symbol) : 0;
+//               if (Number.isFinite(seenVol)) priorVol = Math.max(0, seenVol - Number(q.size));
+//               if (Number.isFinite(seenVol)) volByOcc.set(q.symbol, seenVol);
+//               else volByOcc.set(q.symbol, (volByOcc.get(q.symbol) || 0) + Number(q.size));
+//               const oi = oiByOcc.get(q.symbol) ?? null;
 
-              const { action, action_conf } = classifyOpenClose({
-                qty: Number(q.size), oi, priorVol, side: optSide.side, at
-              });
+//               const { action, action_conf } = classifyOpenClose({
+//                 qty: Number(q.size), oi, priorVol, side: optSide.side, at
+//               });
 
-              broadcast({
-                type: "option_ts",
-                symbol: q.symbol,
-                data: {
-                  id: `ots_${q.symbol}_${q.trade_time || Date.now()}`,
-                  ts: Date.now(),
-                  option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(q.symbol) ? "C" : "P" },
-                  qty: q.size,
-                  price,
-                  side: optSide.side,
-                  side_src: optSide.side_src,
-                  oi, priorVol, book, at,
-                  action, action_conf
-                }
-              });
-            }
-          } else {
-            broadcast({ type: "quotes", data: q });
-          }
-        }
-      } catch { /* ignore */ }
-    };
-    es.onerror = () => { es.close(); setTimeout(() => startQuoteStream(uniq), 1500); };
-  } catch (e) {
-    console.error("startQuoteStream error:", errToJson(e));
-  }
-}
+//               broadcast({
+//                 type: "option_ts",
+//                 symbol: q.symbol,
+//                 data: {
+//                   id: `ots_${q.symbol}_${q.trade_time || Date.now()}`,
+//                   ts: Date.now(),
+//                   option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(q.symbol) ? "C" : "P" },
+//                   qty: q.size,
+//                   price,
+//                   side: optSide.side,
+//                   side_src: optSide.side_src,
+//                   oi, priorVol, book, at,
+//                   action, action_conf
+//                 }
+//               });
+//             }
+//           } else {
+//             broadcast({ type: "quotes", data: q });
+//           }
+//         }
+//       } catch { /* ignore */ }
+//     };
+//     es.onerror = () => { es.close(); setTimeout(() => startQuoteStream(uniq), 1500); };
+//   } catch (e) {
+//     console.error("startQuoteStream error:", errToJson(e));
+//   }
+// }
 
 
 let stopCurrentWatch = null;
