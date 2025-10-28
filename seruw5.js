@@ -61,9 +61,11 @@ const app = express();
 const ORIGINS = [
   "https://tradeflash.pro",
   "https://tradeflashcli.vercel.app",
+  "https://tradeflash-production.up.railway.app",
   "http://localhost:3000",
   "http://localhost:5173",
   "http://localhost:8080",
+  "http://localhost:8081",
 ];
 
 app.use((req, res, next) => {
@@ -223,6 +225,7 @@ const alpLastBySym = new Map(); // symbol -> last trade ID (or ts/price) we’ve
 /* ------------------------ side inference + books (existing) ------------------------ */
 const midBySym = new Map();        // symbol -> { bid, ask, mid }
 const lastTradeBySym = new Map();  // symbol -> last trade price we broadcast
+app.set("etag", false);
 function updateMidFromQuote(q) {
   const bid = Number(q.bid ?? NaN);
   const ask = Number(q.ask ?? NaN);
@@ -1059,6 +1062,303 @@ function isMarketOpenNY() {
   return mins >= (9 * 60 + 30) && mins < (16 * 60); // 09:30–16:00 ET
 }
 
+// async function replayEquityTimesales({ symbol, minutes=390, speed=60, provider="tradier" }) {
+//   const day = lastMarketDayISO(); // your helper for previous trading day
+//   const { data } = await TRADIER.get("/v1/markets/timesales", {
+//     params: { symbol, interval: "tick", start: `${day} 09:30:00`, end: `${day} 16:00:00` }
+//   });
+//   const ticks = (data?.series?.data || []).slice(-minutes*60); // crude trim
+//   for (const t of ticks) {
+//     const price = Number(t.price ?? t.last);
+//     const qty   = Number(t.size  ?? t.volume);
+//     if (price > 0 && qty > 0) {
+//       broadcast({ type: "equity_ts", symbol, data: { price, qty, time: t.time, bid: t.bid, ask: t.ask, side_src:"mid" }});
+//     }
+//     await delay(speed);
+//   }
+// }
+
+const BATCH = 40; // avoid 413/429 on /quotes
+const SLEEP = 120; // ms between Tradier calls to be gentle
+
+function yymmdd(exp) {
+  // exp: "2025-11-15" -> "251115"
+  return String(exp).replace(/-/g, "").slice(2);
+}
+function strikeToOCC8(strike) {
+  // OCC 8-digit strike with 3 implied decimals
+  const k = Math.round(Number(strike) * 1000);
+  return String(k).padStart(8, "0");
+}
+function toOCC(root, expiry, right, strike) {
+  return `${root.toUpperCase()}${yymmdd(expiry)}${right}${strikeToOCC8(strike)}`;
+}
+async function getExpiries(root) {
+  // /markets/options/expirations?symbol=SPY&includeAllRoots=true&strikes=false
+  const call = () => TRADIER.get("/markets/options/expirations", {
+    params: { symbol: root, includeAllRoots: true, strikes: false }
+  });
+
+  const { data } = await withRetry(call, 2);
+  const exps = data?.expirations?.date || data?.expirations || [];
+  return Array.isArray(exps) ? exps.map(String) : [];
+}
+// async function getExpiries(root) {
+//   // Nearest few expiries (weekly/next monthly). You can tune 'include_all_roots'.
+//   const { data } = await TRADIER.get("/v1/markets/options/expirations", {
+//     params: { symbol: root, strikes: "false", include_all_roots: "false" }
+//   });
+//   const exps = data?.expirations?.date || [];
+//   // normalized as array of "YYYY-MM-DD"
+//   return exps.slice(0, 2);
+// }
+
+// --- Env config ---
+// const TRADIER_BASE  = process.env.TRADIER_BASE  || "https://api.tradier.com"; // or paper: https://sandbox.tradier.com
+// const TRADIER_TOKEN = process.env.TRADIER_TOKEN || process.env.TRADIER_ACCESS_TOKEN || "";
+
+// --- Small sleep helper (used by retry) ---
+const delay = (ms) => new Promise(res => setTimeout(res, ms));
+
+// --- Axios instance ---
+const TRADIER = axios.create({
+  baseURL: `${TRADIER_BASE}/v1`,
+  timeout: 25_000,
+  headers: {
+    // Tradier uses OAuth Bearer token
+    Authorization: `Bearer ${TRADIER_TOKEN}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  },
+  // make sure arrays/commas serialize predictably
+  paramsSerializer: (params) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+      if (Array.isArray(v)) qs.set(k, v.join(","));
+      else if (v != null)   qs.set(k, String(v));
+    }
+    return qs.toString();
+  },
+});
+
+// --- Gentle retry/backoff for 429/5xx + Apigee "Body buffer overflow" ---
+TRADIER.interceptors.response.use(
+  (resp) => resp,
+  async (err) => {
+    const cfg = err.config || {};
+    cfg.__retryCount = cfg.__retryCount || 0;
+
+    const status = err?.response?.status;
+    const fault  = err?.response?.data?.fault?.faultstring || "";
+    const retriable =
+      status === 429 ||
+      (status >= 500 && status < 600) ||
+      /Body buffer overflow/i.test(fault);
+
+    if (retriable && cfg.__retryCount < 3) {
+      cfg.__retryCount += 1;
+      // exponential backoff: 400ms, 800ms, 1600ms (+ jitter)
+      const backoff = (2 ** (cfg.__retryCount - 1)) * 400 + Math.random() * 150;
+      await delay(backoff);
+      return TRADIER(cfg);
+    }
+
+    // bubble up with a friendlier message if present
+    const msg =
+      err?.response?.data?.fault?.faultstring ||
+      err?.response?.data?.message ||
+      err?.message ||
+      "Tradier request failed";
+    const e = new Error(msg);
+    e.response = err.response;
+    throw e;
+  }
+);
+
+// --- Headers for SSE EventSource streams (quotes/timesales) ---
+// function H_SSE() {
+//   return {
+//     Authorization: `Bearer ${TRADIER_TOKEN}`,
+//     Accept: "text/event-stream",
+//   };
+// }
+
+// simple retry-once helper
+async function withRetry(promiseFactory, tries = 2, backoffMs = 400) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await promiseFactory(); }
+    catch (e) { lastErr = e; await new Promise(r => setTimeout(r, backoffMs)); }
+  }
+  throw lastErr;
+}
+async function getUnderlyingQuotes(symbols = []) {
+  const out = {};
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    const slice = symbols.slice(i, i + BATCH);
+    const { data } = await TRADIER.get("/v1/markets/quotes", {
+      params: { symbols: slice.join(",") }
+    });
+    const arr = Array.isArray(data?.quotes?.quote)
+      ? data.quotes.quote
+      : (data?.quotes?.quote ? [data.quotes.quote] : []);
+    for (const q of arr) out[String(q.symbol)] = q;
+    await delay(SLEEP);
+  }
+  return out; // { SPY: {...}, QQQ: {...}, ... }
+}
+
+async function getChain(root, expiry) {
+  // No greeks needed; smaller payload
+  const { data } = await TRADIER.get("/v1/markets/options/chains", {
+    params: { symbol: root, expiration: expiry, greeks: "false" }
+  });
+  // normalize to flat array
+  const arr = Array.isArray(data?.options?.option)
+    ? data.options.option
+    : (data?.options?.option ? [data.options.option] : []);
+  return arr;
+}
+
+async function getOccQuotes(occSyms = []) {
+  const out = {};
+  for (let i = 0; i < occSyms.length; i += BATCH) {
+    const slice = occSyms.slice(i, i + BATCH);
+    const { data } = await TRADIER.get("/v1/markets/quotes", {
+      params: { symbols: slice.join(",") }
+    });
+    const arr = Array.isArray(data?.quotes?.quote)
+      ? data.quotes.quote
+      : (data?.quotes?.quote ? [data.quotes.quote] : []);
+    for (const q of arr) out[String(q.symbol)] = q;
+    await delay(SLEEP);
+  }
+  return out; // { OCC: {...}, ... }
+}
+
+function pickWithinMoneyness(chain, spot, moneyness = 0.25) {
+  if (!(spot > 0)) return [];
+  const isNum = (x) => Number.isFinite(Number(x));
+  const within = chain.filter(c => {
+    const k = Number(c.strike);
+    if (!isNum(k)) return false;
+    const rel = Math.abs(k - spot) / spot;
+    return rel <= moneyness;
+  });
+  // mildly preference near-the-money and balanced C/P
+  within.sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot));
+  return within;
+}
+
+function asMid(q) {
+  const bid = Number(q?.bid), ask = Number(q?.ask);
+  if (Number.isFinite(bid) && Number.isFinite(ask) && ask >= bid) {
+    return (bid + ask) / 2;
+  }
+  const last = Number(q?.last);
+  if (Number.isFinite(last)) return last;
+  return NaN;
+}
+
+/**
+ * Build a sequence of "quote frames" for OCC contracts that your replay loop
+ * can feed into the same path that generates `option_ts` during live.
+ *
+ * Returns: Array<{ symbol, last, size, bid, ask, trade_time }>
+ * The array is already time-stamped in ascending order (older -> newer).
+ */
+async function loadOccQuoteFrames({
+  roots = [],
+  minutes = 390,
+  moneyness = 0.25,
+  limit = 200
+}) {
+  if (!Array.isArray(roots) || roots.length === 0) return [];
+
+  // 1) Underlying spot (to filter moneyness)
+  const rootQuotes = await getUnderlyingQuotes(roots);
+  const spotByRoot = {};
+  for (const r of roots) {
+    const q = rootQuotes[r];
+    const spot = Number(q?.last ?? q?.close ?? q?.bid ?? q?.ask);
+    if (Number.isFinite(spot)) spotByRoot[r] = spot;
+  }
+
+  // 2) Build OCC universe: nearest 1–2 expiries, moneyness slice
+  const occUniverse = [];
+  for (const root of roots) {
+    const spot = spotByRoot[root];
+    const expiries = await getExpiries(root);
+    for (const exp of expiries) {
+      const chain = await getChain(root, exp);
+      const slice = pickWithinMoneyness(chain, spot, moneyness);
+      for (const c of slice) {
+        const right = String(c.option_type || c.right || "").toUpperCase().startsWith("P") ? "P" : "C";
+        const occ = toOCC(root, exp, right, Number(c.strike));
+        occUniverse.push(occ);
+      }
+      await delay(SLEEP);
+    }
+  }
+  if (occUniverse.length === 0) return [];
+
+  // 3) Pull snapshots for OCC and compute mids
+  const occQuotes = await getOccQuotes(occUniverse);
+  const now = Date.now();
+  const spanMs = Math.max(1, minutes) * 60 * 1000;
+
+  // 4) Materialize frames (limit them and distribute times)
+  const items = [];
+  for (const occ of occUniverse) {
+    const q = occQuotes[occ] || {};
+    const mid = asMid(q);
+    if (!Number.isFinite(mid)) continue;
+
+    // If q.size/last_size isn’t available, fake a tiny print (1–5)
+    const sz = Number(q?.size ?? q?.last_size);
+    const size = Number.isFinite(sz) && sz > 0 ? sz : (1 + Math.floor(Math.random()*5));
+
+    // Create a pseudo trade_time spread across the requested span
+    const jitter = Math.random() * 0.6 + 0.2; // 0.2–0.8
+    const t = now - Math.floor(jitter * spanMs);
+
+    items.push({
+      symbol: occ,
+      last: mid,
+      size,
+      bid: Number(q?.bid) || undefined,
+      ask: Number(q?.ask) || undefined,
+      trade_time: new Date(t).toISOString()
+    });
+  }
+
+  // Sort by time ascending, then trim to limit
+  items.sort((a, b) => new Date(a.trade_time).valueOf() - new Date(b.trade_time).valueOf());
+  return items.slice(-limit);
+}
+
+// module.exports = { loadOccQuoteFrames };
+
+async function replayOptionsFromQuotes({ roots=[], minutes=390, speed=60, moneyness=0.25, limit=200, provider }) {
+  // your own store/fetch of quote ticks for OCC; walk them and re-emit using the same block you had in startQuoteStream()
+  const frames = await loadOccQuoteFrames({ roots, minutes, moneyness, limit }); // implement to fit your storage
+  for (const q of frames) {
+    // reuse your existing classify/infer code:
+    const price = Number(q.last);
+    const qty   = Number(q.size);
+    if (price > 0 && qty > 0) {
+      const book = { bid: q.bid, ask: q.ask, mid: q.mid };
+      const { side, side_src } = inferSideServer(q.symbol, price);
+      broadcast({
+        type: "option_ts",
+        symbol: q.symbol,
+        data: { price, qty, time: q.trade_time, side, side_src, book, at: whereAt(price, book) }
+      });
+    }
+    await delay(speed);
+  }
+}
+
 // --- Historical equity ticks (Tradier timesales) ---
 async function getEquityTimesales(symbol, dayISO, minutes) {
   try {
@@ -1324,51 +1624,304 @@ async function replayEquityTimesales({ symbols = [], day, minutes = 390, speed =
 //     res.status(detail.status || 500).json({ ok:false, error: detail });
 //   }
 // });
+// server/app.js (or your routes file)
+// const { isMarketOpenNY } = require("./utils/market");
 
+// GET /watch?...&live=0|1&replay=0|1&minutes=390&speed=60
+// app.get("/watch", async (req, res) => {
+//   try {
+//     const symbols   = (String(req.query.symbols||"").split(",").filter(Boolean));
+//     const eqForTS   = (String(req.query.eqForTS||"").split(",").filter(Boolean));
+//     const provider  = String(req.query.provider || "tradier");
+//     const limit     = Number(req.query.limit || 200);
+//     const backfill  = Number(req.query.backfill || 0);
+//     const moneyness = Number(req.query.moneyness || 0.25);
+
+//     // smart defaults if client didn’t pass them
+//     const liveQ     = req.query.live != null ? Number(req.query.live) : (isMarketOpenNY() ? 1 : 0);
+//     const replayQ   = req.query.replay != null ? Number(req.query.replay) : (liveQ ? 0 : 1);
+//     const minutes   = Number(req.query.minutes || 390);
+//     const speed     = Number(req.query.speed   || 60);
+
+//     // immediately respond with mode confirmation so client can render a banner
+//     res.json({
+//       ok: true,
+//       provider,
+//       env: { provider, mode: liveQ ? "live" : "replay", minutes, speed },
+//     });
+
+//     // start background stream to WS clients
+//     if (liveQ) {
+//       // your existing live streams
+//       startQuoteStream([...symbols, ...eqForTS]);        // emits "quotes" and derived "option_ts"
+//       // plus any equity T&S live source you already have → must emit "equity_ts"
+//     } else {
+//       // REPLAY LAST SESSION
+//       // 1) equity T&S replay for each eqForTS
+//       for (const sym of eqForTS) {
+//         replayEquityTimesales({ symbol: sym, minutes, speed, provider }); // must emit "equity_ts"
+//       }
+//       // 2) options replay: synthesize option trades from your cached/queried quotes
+//       await replayOptionsFromQuotes({ roots: symbols, minutes, speed, moneyness, limit, provider }); // must emit "option_ts"
+//     }
+//   } catch (e) {
+//     console.error("/watch error", e?.response?.data || e);
+//     res.status(500).json({ ok:false, error: String(e?.message || e) });
+//   }
+// });
+
+// app.get("/watch", async (req, res) => {
+//   try {
+//     const provider = String(req.query.provider || "tradier").toLowerCase();
+//     const symbols  = String(req.query.symbols || "SPY").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+//     const eqForTS  = String(req.query.eqForTS || symbols.join(",")).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+//     const live    = req.query.live === "1";     // live mode
+//     const replay  = req.query.replay === "1";   // replay mode
+//     const minutes = Number(req.query.minutes || 390);
+//     const speed   = Number(req.query.speed || 60);
+//     const backfillMins = Number(req.query.backfill || 0);
+
+//     // stop any prior runs
+//     if (typeof stopCurrentWatch === "function") { try { stopCurrentWatch(); } catch {} stopCurrentWatch = null; }
+//     if (typeof stopReplay === "function")       { try { stopReplay(); }       catch {} stopReplay = null; }
+
+//     if (live) {
+//       const day = parseDay(req);
+//       if (backfillMins > 0) {
+//         await Promise.all((eqForTS.length ? eqForTS : symbols).map(sym => backfillEquityTS(sym, day, backfillMins)));
+//       }
+//       // start your existing live streams (quotes/SSE/etc.)
+//       // startQuoteStream([...symbols, ...occSet]);  // keep your logic here
+//       return res.json({ ok: true, mode: "live", provider, env:{ provider }, watching: { symbols, eqForTS } });
+//     }
+
+//     if (replay) {
+//       const day = parseDay(req);
+//       stopReplay = await replayEquityTimesales({
+//         symbols: eqForTS.length ? eqForTS : symbols,
+//         day, minutes, speed
+//       });
+//       return res.json({ ok: true, mode: "replay", provider, day, minutes, speed, watching: { symbols, eqForTS } });
+//     }
+
+//     // default: treat as live
+//     return res.json({ ok: true, mode: "live-default", provider, watching: { symbols, eqForTS } });
+//   } catch (e) {
+//     const detail = errToJson(e);
+//     console.error("/watch error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
+// let stopCurrentWatch = null;
+
+// app.get("/watch", async (req, res) => {
+//   try {
+//     const provider = String(req.query.provider || "tradier").toLowerCase();
+
+//     const symbols = String(req.query.symbols || "SPY")
+//       .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+//     const eqForTS = String(req.query.eqForTS || symbols.join(","))
+//       .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+//     const day = (req.query.day && /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.day)))
+//       ? String(req.query.day)
+//       : parseDay(req); // your existing helper (handles weekend -> prior Fri)
+
+//     const live    = req.query.live === "0" ? 0 : 1;
+//     const replay  = req.query.replay === "1" ? 1 : 0;
+//     const speedMs = Number(req.query.speed || 100);
+
+//     const minutes   = Number(req.query.minutes || req.query.backfill || 5);
+//     const moneyness = Number(req.query.moneyness || 0.25);
+//     const limit     = Number(req.query.limit || 150);
+//     const expiries  = String(req.query.expiries || "")
+//                         .split(",").map(s => s.trim()).filter(Boolean);
+
+//     // Stop any previous loops if you are keeping state:
+//     if (typeof stopCurrentWatch === "function") {
+//       try { stopCurrentWatch(); } catch {}
+//       stopCurrentWatch = null;
+//     }
+
+//     // ---- Build OCC set for options (same as you do today) ----
+//     const occSet = new Set();
+//     for (const s of symbols) {
+//       try {
+//         const occ = await buildOptionsWatchList(
+//           s,
+//           { expiries, moneyness, limit: Math.ceil(limit / Math.max(1, symbols.length)) }
+//         );
+//         occ.forEach(x => occSet.add(x));
+//       } catch (e) {
+//         console.warn("buildOptionsWatchList failed", s, errToJson(e));
+//       }
+//     }
+
+//     // ---- EQUITIES: backfill or replay for requested session ----
+//     if (minutes > 0) {
+//       if (replay) {
+//         // fetch all rows up-front and drip them out
+//         for (const sym of eqForTS) {
+//           const rows = await getEquityTimesales(sym, day, minutes);
+//           replayEquityTimesales(sym, rows, speedMs);
+//         }
+//       } else {
+//         // immediate backfill (your existing behavior)
+//         await Promise.all(eqForTS.map(sym => backfillEquityTS(sym, day, minutes)));
+//       }
+//     }
+
+//     // ---- OPTIONS: light seeding (optional) ----
+//     // If you want to show *something* for options off-hours, you can emit
+//     // a synthetic “snapshot” frame for top OCCs (comment out if undesired).
+//     for (const occ of Array.from(occSet).slice(0, 100)) {
+//       const book = midBySym.get(occ) || {};
+//       const px = Number.isFinite(book.mid) ? book.mid : (book.ask ?? book.bid ?? 0);
+//       if (!(px > 0)) continue;
+//       const sidePack = inferSideServer(occ, px);
+//       const oi = oiByOcc.get(occ) ?? null;
+//       const priorVol = volByOcc.get(occ) ?? 0;
+
+//       broadcast({
+//         type: "option_ts",
+//         symbol: occ,
+//         data: {
+//           id: `ots_${occ}_${day}`,
+//           ts: Date.now(),
+//           option: { expiry: "", strike: 0, right: /C\d{8}$/i.test(occ) ? "C" : "P" },
+//           qty: 1, price: px,
+//           side: sidePack.side, side_src: sidePack.side_src,
+//           oi, priorVol, book, at: "between",
+//           action: "—", action_conf: "low"
+//         }
+//       });
+//     }
+
+//     // ---- Live streaming (only when live=1) ----
+//     if (live === 1) {
+//       if (provider === "polygon") {
+//         stopCurrentWatch = await startPolygonWatch({
+//           equities: symbols,
+//           moneyness,
+//           limit,
+//           broadcast,
+//           classifyOptionAction: classifyOpenClose,
+//         });
+//       } else {
+//         // Keep your existing real-time path (Tradier SSE for quotes / options)
+//         startQuoteStream([ ...symbols, ...occSet ]);
+//       }
+//     }
+
+//     return res.json({
+//       ok: true,
+//       provider,
+//       env: { provider, base: TRADIER_BASE, sandbox: isSandbox, ts_interval: TS_INTERVAL },
+//       watching: { equities: symbols, options_count: occSet.size, eqForTS, day, minutes, live, replay, speedMs, limit, moneyness }
+//     });
+//   } catch (e) {
+//     const detail = errToJson(e);
+//     console.error("/watch error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
+
+// GET /watch?...&live=0|1&replay=0|1&minutes=390&speed=60
+// app.get("/watch", async (req, res) => {
+//   res.set({
+//     "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+//     Pragma: "no-cache",
+//     Expires: "0",
+//   });  
+//   try {
+//     const symbols   = (String(req.query.symbols||"").split(",").filter(Boolean));
+//     const eqForTS   = (String(req.query.eqForTS||"").split(",").filter(Boolean));
+//     const provider  = String(req.query.provider || "tradier");
+//     const limit     = Number(req.query.limit || 200);
+//     const backfill  = Number(req.query.backfill || 0);
+//     const moneyness = Number(req.query.moneyness || 0.25);
+
+//     // smart defaults if client didn’t pass them
+//     const liveQ     = req.query.live != null ? Number(req.query.live) : (isMarketOpenNY() ? 1 : 0);
+//     const replayQ   = req.query.replay != null ? Number(req.query.replay) : (liveQ ? 0 : 1);
+//     const minutes   = Number(req.query.minutes || 390);
+//     const speed     = Number(req.query.speed   || 60);
+
+//     // immediately respond with mode confirmation so client can render a banner
+//     res.json({
+//       ok: true,
+//       provider,
+//       env: { provider, mode: liveQ ? "live" : "replay", minutes, speed },
+//     });
+
+//     // start background stream to WS clients
+//     if (liveQ) {
+//       // your existing live streams
+//       startQuoteStream([...symbols, ...eqForTS]);        // emits "quotes" and derived "option_ts"
+//       // plus any equity T&S live source you already have → must emit "equity_ts"
+//     } else {
+//       // REPLAY LAST SESSION
+//       // 1) equity T&S replay for each eqForTS
+//       for (const sym of eqForTS) {
+//         replayEquityTimesales({ symbol: sym, minutes, speed, provider }); // must emit "equity_ts"
+//       }
+//       // 2) options replay: synthesize option trades from your cached/queried quotes
+//       await replayOptionsFromQuotes({ roots: symbols, minutes, speed, moneyness, limit, provider }); // must emit "option_ts"
+//     }
+//   } catch (e) {
+//     console.error("/watch error", e?.response?.data || e);
+//     res.status(500).json({ ok:false, error: String(e?.message || e) });
+//   }
+// });
+// --- FLOW APIs ---
+// const { normalizeTradier } = require("./tradier");
+// const { normalizeAlpaca } = require("./alpaca");
+// const { enqueueFlow } = require("./flowFanout");
+
+import { normalizeTradier } from "./tradier.js";
+import { normalizeAlpaca } from "./alpaca.js";
+import { enqueueFlow } from "./flowFanout.js";
+
+// Unified /watch endpoint for both providers
 app.get("/watch", async (req, res) => {
+  const provider = req.query.provider || "tradier";
+  const symbols = (req.query.symbols || "SPY").split(",");
+  console.log(`/watch symbols=${symbols.join(",")} (provider=${provider})`);
+
   try {
-    const provider = String(req.query.provider || "tradier").toLowerCase();
-    const symbols  = String(req.query.symbols || "SPY").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-    const eqForTS  = String(req.query.eqForTS || symbols.join(",")).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
-
-    const live    = req.query.live === "1";     // live mode
-    const replay  = req.query.replay === "1";   // replay mode
-    const minutes = Number(req.query.minutes || 390);
-    const speed   = Number(req.query.speed || 60);
-    const backfillMins = Number(req.query.backfill || 0);
-
-    // stop any prior runs
-    if (typeof stopCurrentWatch === "function") { try { stopCurrentWatch(); } catch {} stopCurrentWatch = null; }
-    if (typeof stopReplay === "function")       { try { stopReplay(); }       catch {} stopReplay = null; }
-
-    if (live) {
-      const day = parseDay(req);
-      if (backfillMins > 0) {
-        await Promise.all((eqForTS.length ? eqForTS : symbols).map(sym => backfillEquityTS(sym, day, backfillMins)));
-      }
-      // start your existing live streams (quotes/SSE/etc.)
-      // startQuoteStream([...symbols, ...occSet]);  // keep your logic here
-      return res.json({ ok: true, mode: "live", provider, env:{ provider }, watching: { symbols, eqForTS } });
+    // choose your real data source here — demo uses mock
+    let flows = [];
+    if (provider === "tradier") {
+      // fetch or mock your tradier time & sales
+      const raw = []; // ← fill from your actual Tradier API call
+      flows = normalizeTradier(raw);
+    } else if (provider === "alpaca") {
+      const raw = []; // ← fill from your Alpaca data
+      flows = normalizeAlpaca(raw);
     }
 
-    if (replay) {
-      const day = parseDay(req);
-      stopReplay = await replayEquityTimesales({
-        symbols: eqForTS.length ? eqForTS : symbols,
-        day, minutes, speed
-      });
-      return res.json({ ok: true, mode: "replay", provider, day, minutes, speed, watching: { symbols, eqForTS } });
-    }
-
-    // default: treat as live
-    return res.json({ ok: true, mode: "live-default", provider, watching: { symbols, eqForTS } });
-  } catch (e) {
-    const detail = errToJson(e);
-    console.error("/watch error:", detail);
-    res.status(detail.status || 500).json({ ok:false, error: detail });
+    enqueueFlow(wss, flows);
+    res.json({ ok: true, count: flows.length });
+  } catch (err) {
+    console.error("/watch error", err);
+    res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
+// Optional manual pushes for testing
+app.post("/_dev/push/tradier", (req, res) => {
+  const items = normalizeTradier(req.body || []);
+  enqueueFlow(wss, items);
+  res.json({ ok: true, received: items.length });
+});
+
+app.post("/_dev/push/alpaca", (req, res) => {
+  const items = normalizeAlpaca(req.body || []);
+  enqueueFlow(wss, items);
+  res.json({ ok: true, received: items.length });
+});
 /*
 let stopCurrentWatch = null; // allow switching providers without restarting the server
 
@@ -1929,63 +2482,63 @@ function pushHistory(snap) {
   while (ALP_HISTORY.length && (now - ALP_HISTORY[0].ts) > sevenDays) ALP_HISTORY.shift();
 }
 // ---- Fetch recent daily bars for ATR ----
-async function alpacaDailyBars(symbols = [], limit = 20) {
-  // GET /v2/stocks/bars?timeframe=1Day&symbols=...&limit=20
-  const MAX = 50;
-  const out = {};
-  for (let i = 0; i < symbols.length; i += MAX) {
-    const slice = symbols.slice(i, i + MAX);
-    const { data } = await ALPACA.get("/v2/stocks/bars", {
-      params: { symbols: slice.join(","), timeframe: "1Day", limit }
-    });
-    // shape: { bars: { SYM: [ { o,h,l,c,v,t }, ... ] } }
-    const bars = data?.bars || {};
-    Object.assign(out, bars);
-  }
-  return out; // { SYM: [bars...] }
-}
+// async function alpacaDailyBars(symbols = [], limit = 20) {
+//   // GET /v2/stocks/bars?timeframe=1Day&symbols=...&limit=20
+//   const MAX = 50;
+//   const out = {};
+//   for (let i = 0; i < symbols.length; i += MAX) {
+//     const slice = symbols.slice(i, i + MAX);
+//     const { data } = await ALPACA.get("/v2/stocks/bars", {
+//       params: { symbols: slice.join(","), timeframe: "1Day", limit }
+//     });
+//     // shape: { bars: { SYM: [ { o,h,l,c,v,t }, ... ] } }
+//     const bars = data?.bars || {};
+//     Object.assign(out, bars);
+//   }
+//   return out; // { SYM: [bars...] }
+// }
 
-function computeATR14(bars = []) {
-  // bars: most-recent last; we’ll work from oldest->newest
-  if (!Array.isArray(bars) || bars.length < 15) return 0;
-  const arr = [...bars].slice(-15); // need 15 to get 14 TRs
-  // ensure ascending by time:
-  arr.sort((a,b) => new Date(a.t).valueOf() - new Date(b.t).valueOf());
+// function computeATR14(bars = []) {
+//   // bars: most-recent last; we’ll work from oldest->newest
+//   if (!Array.isArray(bars) || bars.length < 15) return 0;
+//   const arr = [...bars].slice(-15); // need 15 to get 14 TRs
+//   // ensure ascending by time:
+//   arr.sort((a,b) => new Date(a.t).valueOf() - new Date(b.t).valueOf());
 
-  let prevClose = Number(arr[0].c);
-  let sumTR = 0;
-  for (let i = 1; i < arr.length; i++) {
-    const b = arr[i];
-    const h = Number(b.h), l = Number(b.l), cPrev = Number(prevClose);
-    const tr = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
-    sumTR += tr;
-    prevClose = Number(b.c);
-  }
-  return sumTR / 14;
-}
+//   let prevClose = Number(arr[0].c);
+//   let sumTR = 0;
+//   for (let i = 1; i < arr.length; i++) {
+//     const b = arr[i];
+//     const h = Number(b.h), l = Number(b.l), cPrev = Number(prevClose);
+//     const tr = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
+//     sumTR += tr;
+//     prevClose = Number(b.c);
+//   }
+//   return sumTR / 14;
+// }
 
 // Decide the “last price” based on session
-function chooseSessionPrice(snapshot, session) {
-  // snapshot: { latestTrade, dailyBar, prevDailyBar }
-  const latest = Number(snapshot?.latestTrade?.p ?? snapshot?.latest_trade?.p ?? NaN);
-  const dbar = snapshot?.dailyBar || snapshot?.daily_bar || {};
-  const pbar = snapshot?.prevDailyBar || snapshot?.prev_daily_bar || {};
-  const closeToday = Number(dbar?.c ?? NaN);
-  const openToday  = Number(dbar?.o ?? NaN);
-  const prevClose  = Number(pbar?.c ?? NaN);
+// function chooseSessionPrice(snapshot, session) {
+//   // snapshot: { latestTrade, dailyBar, prevDailyBar }
+//   const latest = Number(snapshot?.latestTrade?.p ?? snapshot?.latest_trade?.p ?? NaN);
+//   const dbar = snapshot?.dailyBar || snapshot?.daily_bar || {};
+//   const pbar = snapshot?.prevDailyBar || snapshot?.prev_daily_bar || {};
+//   const closeToday = Number(dbar?.c ?? NaN);
+//   const openToday  = Number(dbar?.o ?? NaN);
+//   const prevClose  = Number(pbar?.c ?? NaN);
 
-  const isNum = (x) => Number.isFinite(x);
+//   const isNum = (x) => Number.isFinite(x);
 
-  if (session === "pre" || session === "post") {
-    // Use latest trade vs prev close as “session” reference
-    if (isNum(latest)) return { price: latest, prevClose, openToday };
-  }
+//   if (session === "pre" || session === "post") {
+//     // Use latest trade vs prev close as “session” reference
+//     if (isNum(latest)) return { price: latest, prevClose, openToday };
+//   }
 
-  // Regular session default: use today’s close if present, else fall back to latest
-  if (isNum(closeToday)) return { price: closeToday, prevClose, openToday };
-  if (isNum(latest))     return { price: latest,     prevClose, openToday };
-  return { price: NaN, prevClose, openToday };
-}
+//   // Regular session default: use today’s close if present, else fall back to latest
+//   if (isNum(closeToday)) return { price: closeToday, prevClose, openToday };
+//   if (isNum(latest))     return { price: latest,     prevClose, openToday };
+//   return { price: NaN, prevClose, openToday };
+// }
 
 // % helpers
 const pct = (num, den) => (Number.isFinite(num) && Number.isFinite(den) && den !== 0) ? (num/den - 1) : 0;
@@ -2081,107 +2634,578 @@ const pct = (num, den) => (Number.isFinite(num) && Number.isFinite(den) && den !
 //     res.status(detail.status || 500).json({ ok:false, error: detail });
 //   }
 // });
+// ---------- numbers & time ----------
+// function num(x){ const n = Number(x); return Number.isFinite(n) ? n : NaN; }
+
+function isNum(x){ return Number.isFinite(x); }
+
+// Decide the “display price” for a given session from an Alpaca snapshot
+// snapshot shape: { latestTrade, dailyBar, prevDailyBar } (keys can be snake or camel)
+function chooseSessionPrice(snapshot, session) {
+  const lt = snapshot?.latestTrade || snapshot?.latest_trade || {};
+  const dbar = snapshot?.dailyBar || snapshot?.daily_bar || {};
+  const pbar = snapshot?.prevDailyBar || snapshot?.prev_daily_bar || {};
+
+  const latest    = num(lt.p ?? lt.price);
+  const openToday = num(dbar.o ?? dbar.open);
+  const closeToday= num(dbar.c ?? dbar.close);
+  const prevClose = num(pbar.c ?? pbar.close);
+
+  // pre/post: use latest vs prevClose (works off-hours)
+  if (session === "pre" || session === "post") {
+    return { price: isNum(latest) ? latest : NaN, prevClose, openToday };
+  }
+
+  // regular: prefer today close (if scanning after hours) else latest
+  if (isNum(closeToday)) return { price: closeToday, prevClose, openToday };
+  if (isNum(latest))     return { price: latest,     prevClose, openToday };
+  return { price: NaN, prevClose, openToday };
+}
+
+// ---------- ATR(14) over daily bars ----------
+// async function alpacaDailyBars(symbols = [], limit = 20) {
+//   const MAX = 50, out = {};
+//   for (let i = 0; i < symbols.length; i += MAX) {
+//     const slice = symbols.slice(i, i + MAX);
+//     const { data } = await ALPACA.get("/v2/stocks/bars", {
+//       params: { symbols: slice.join(","), timeframe: "1Day", limit }
+//     });
+//     Object.assign(out, data?.bars || {});
+//   }
+//   return out; // { SYM: [{ o,h,l,c,v,t }, ...] }
+// }
+
+// function computeATR14(bars = []) {
+//   if (!Array.isArray(bars) || bars.length < 15) return NaN;
+//   const arr = [...bars].slice(-15).sort((a,b)=> new Date(a.t) - new Date(b.t));
+//   let prevClose = num(arr[0].c);
+//   if (!isNum(prevClose)) return NaN;
+//   let sumTR = 0;
+//   for (let i = 1; i < arr.length; i++) {
+//     const h = num(arr[i].h), l = num(arr[i].l), cPrev = prevClose;
+//     if (!(isNum(h)&&isNum(l)&&isNum(cPrev))) return NaN;
+//     const tr = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
+//     sumTR += tr;
+//     prevClose = num(arr[i].c);
+//   }
+//   return sumTR / 14;
+// }
+
+// ---------- decorate rows with price/%change/gaps/ATR ----------
+// function decorateRows(rows, snaps, barsMap, session) {
+//   return rows.map((r) => {
+//     const sym = r.symbol || r.S;
+//     const snap = snaps[sym] || {};
+//     const { price, prevClose, openToday } = chooseSessionPrice(snap, session);
+
+//     const last         = isNum(price)     ? price     : NaN;
+//     const change_pct   = (isNum(last) && isNum(prevClose)) ? (last/prevClose - 1) : NaN;      // live move vs prevC
+//     const gap_open_pct = (isNum(openToday) && isNum(prevClose)) ? (openToday/prevClose - 1) : NaN; // open vs prevC
+//     const gap_session_pct = (session === "regular") ? gap_open_pct : change_pct;               // use for filtering
+//     const atr14        = computeATR14(barsMap[sym] || []);
+
+//     return {
+//       ...r,
+//       symbol: sym,
+//       last,
+//       price: last,
+//       change_pct,
+//       gap_open_pct,
+//       gap_session_pct,
+//       atr14
+//     };
+//   });
+// }
+
+// // ---------- apply gap filter ----------
+// function filterByGap(rows, filter, minGap) {
+//   if (!filter) return rows;
+//   if (filter === "gapup")   return rows.filter(r => isNum(r.gap_session_pct) && r.gap_session_pct >=  minGap)
+//                                       .sort((a,b)=> Math.abs(b.gap_session_pct) - Math.abs(a.gap_session_pct));
+//   if (filter === "gapdown") return rows.filter(r => isNum(r.gap_session_pct) && r.gap_session_pct <= -minGap)
+//                                       .sort((a,b)=> Math.abs(b.gap_session_pct) - Math.abs(a.gap_session_pct));
+//   return rows;
+// }
+// ---- Snapshots → pick prices for a session, but NEVER coerce to 0
+function chooseSessionFields(snap, session) {
+  const latest   = Number(snap?.latestTrade?.p ?? snap?.latest_trade?.p);
+  const dbar     = snap?.dailyBar      || snap?.daily_bar      || {};
+  const pbar     = snap?.prevDailyBar  || snap?.prev_daily_bar || {};
+  const closeNow = Number(dbar?.c);
+  const openNow  = Number(dbar?.o);
+  const prevClose= Number(pbar?.c);
+
+  const isNum = (x) => Number.isFinite(x);
+
+  // Session reference price:
+  // - pre/post: use latest trade vs prev close
+  // - regular : use closeNow (if present) else latest
+  let price;
+  if (session === "pre" || session === "post") {
+    price = isNum(latest) ? latest : undefined;
+  } else {
+    price = isNum(closeNow) ? closeNow : (isNum(latest) ? latest : undefined);
+  }
+
+  // Gaps:
+  // - gap_open_pct: open vs prev close (only meaningful in REGULAR)
+  const gap_open_pct    = (isNum(openNow) && isNum(prevClose))  ? (openNow / prevClose - 1) : undefined;
+  // - gap_session_pct: latest vs prev close (good for PRE/POST)
+  const gap_session_pct = (isNum(latest)  && isNum(prevClose))  ? (latest  / prevClose - 1) : undefined;
+
+  // Change vs prev close based on “price” we chose
+  const change_pct = (isNum(price) && isNum(prevClose)) ? (price / prevClose - 1) : undefined;
+
+  // Final unified gap for the chosen session
+  const gap_pct = (session === "regular") ? gap_open_pct : gap_session_pct;
+
+  return { price, prevClose: isNum(prevClose) ? prevClose : undefined, openNow: isNum(openNow) ? openNow : undefined,
+           change_pct, gap_open_pct, gap_session_pct, gap_pct };
+}
+
+// ---- ATR (return undefined when not enough/valid bars)
+function computeATR14(bars = []) {
+  if (!Array.isArray(bars) || bars.length < 15) return undefined;
+  const arr = [...bars].slice(-15).sort((a,b) => new Date(a.t) - new Date(b.t));
+  let prevC = Number(arr[0]?.c);
+  if (!Number.isFinite(prevC)) return undefined;
+
+  let sumTR = 0;
+  for (let i = 1; i < arr.length; i++) {
+    const b = arr[i];
+    const h = Number(b.h), l = Number(b.l), cPrev = prevC;
+    if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(cPrev)) return undefined;
+    const tr = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
+    sumTR += tr;
+    prevC = Number(b.c);
+  }
+  const atr = sumTR / 14;
+  return Number.isFinite(atr) ? atr : undefined;
+}
+
+// ---- Daily bars (be strict about shape; leave missing as [])
+async function alpacaDailyBars(symbols = [], limit = 20) {
+  const MAX = 50;
+  const out = {};
+  for (let i = 0; i < symbols.length; i += MAX) {
+    const slice = symbols.slice(i, i + MAX);
+    const { data } = await ALPACA.get("/v2/stocks/bars", {
+      params: { symbols: slice.join(","), timeframe: "1Day", limit }
+    });
+    const bars = data?.bars || {};
+    for (const [sym, arr] of Object.entries(bars)) {
+      out[sym] = Array.isArray(arr) ? arr : [];
+    }
+    // Ensure any symbol not returned gets an empty array (prevents 0 ATR glitch)
+    for (const s of slice) if (!out[s]) out[s] = [];
+  }
+  return out; // { SYM: [bars...] }
+}
+
+// ---- Decorate a row array with session-aware fields & ATR
+function decorateRows(rows, snapMap, barsMap, session) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map(r => {
+    const sym   = String(r.symbol || r.S || "");
+    const snap  = snapMap[sym] || {};
+    const bars  = barsMap[sym] || [];
+    const s     = chooseSessionFields(snap, session);
+    const atr14 = computeATR14(bars);
+    return {
+      ...r,
+      symbol: sym,
+      price: s.price,
+      last: s.price,
+      change_pct: s.change_pct,
+      gap_open_pct: s.gap_open_pct,
+      gap_session_pct: s.gap_session_pct,
+      gap_pct: s.gap_pct,
+      atr14
+    };
+  });
+}
+
+// ---- Gap filter (returns only rows where the relevant gap is present)
+function filterByGap(rows, filter, minGap) {
+  if (!filter) return rows;
+  const isNum = (x) => Number.isFinite(x);
+  if (filter === "gapup")   return rows.filter(r => isNum(r.gap_pct) && r.gap_pct >=  minGap);
+  if (filter === "gapdown") return rows.filter(r => isNum(r.gap_pct) && r.gap_pct <= -minGap);
+  return rows;
+}
+// app.get("/alpaca/scan", async (req, res) => {
+//   try {
+//     const by      = String(req.query.by || "volume");      // "volume" | "trade_count"
+//     const top     = Number(req.query.top || 30);
+//     const refresh = req.query.refresh === "0" ? 0 : 1;
+
+//     // NEW: filters
+//     let session = String(req.query.session || "regular").toLowerCase(); // "pre" | "regular" | "post"
+//     if (!["pre","regular","post"].includes(session)) session = "regular";
+
+//     let filter = String(req.query.filter || "").toLowerCase(); // "gapup" | "gapdown" | ""
+//     if (!["gapup","gapdown",""].includes(filter)) filter = "";
+
+//     const minGap = Number.isFinite(+req.query.minGap) ? Math.max(0, Number(req.query.minGap)) : 0.02; // 2%
+
+//     if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
+//       return res.status(400).json({ ok: false, error: "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
+//     }
+//     if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret) {
+//       return res.status(400).json({ ok:false, error:"Missing Alpaca credentials" });
+//     }
+
+//     // Pull most-actives & movers (you already had this)
+//     const [actives, mv] = await Promise.all([
+//       alpacaMostActives({ by, top }),
+//       alpacaMovers({ top })
+//     ]);
+//     const gainers = mv.gainers || [];
+//     const losers  = mv.losers  || [];
+
+//     // Build symbol universe to enrich
+//     const wanted = [
+//       ...new Set([
+//         ...actives.map(x => x.symbol),
+//         ...gainers.map(x => x.symbol),
+//         ...losers.map(x => x.symbol),
+//       ])
+//     ];
+
+//     // Snapshots for price/prevClose/open; Daily bars for ATR
+//     const [snaps, barsMap] = await Promise.all([
+//       alpacaSnapshots(wanted),
+//       alpacaDailyBars(wanted, 20)
+//     ]);
+
+//     // Decorate with session-aware price, %change, gap %, ATR
+//     const decorate = (rows) => rows.map(r => {
+//       const sym = r.symbol || r.S;
+//       const snap = snaps[sym] || {};
+//       const { price, prevClose, openToday } = chooseSessionPrice(snap, session);
+//       const isNum = (x) => Number.isFinite(x);
+
+//       const change_pct = (isNum(price) && isNum(prevClose)) ? (price / prevClose - 1) : 0;
+//       const gap_pct    = (isNum(openToday) && isNum(prevClose)) ? (openToday / prevClose - 1) : 0;
+
+//       const atr14 = computeATR14(barsMap[sym] || []);
+
+//       return {
+//         ...r,
+//         symbol: sym,
+//         price,
+//         last: price,
+//         change_pct,  // e.g., 0.034 = +3.4%
+//         gap_pct,     // open vs prev close
+//         atr14,       // in price units
+//       };
+//     });
+
+//     let most = decorate(actives);
+//     let g    = decorate(gainers);
+//     let l    = decorate(losers);
+
+//     // Apply gap filter if requested
+//     if (filter === "gapup") {
+//       const pred = (row) => Number.isFinite(row.gap_pct) && row.gap_pct >= minGap;
+//       most = most.filter(pred);
+//       g    = g.filter(pred);
+//       l    = l.filter(pred);
+//     } else if (filter === "gapdown") {
+//       const pred = (row) => Number.isFinite(row.gap_pct) && row.gap_pct <= -minGap;
+//       most = most.filter(pred);
+//       g    = g.filter(pred);
+//       l    = l.filter(pred);
+//     }
+
+//     return res.json({
+//       ok: true,
+//       ts: Date.now(),
+//       params: { by, top, session, filter, minGap },
+//       groups: {
+//         most_actives: most,
+//         gainers: g,
+//         losers: l
+//       }
+//     });
+//   } catch (e) {
+//     const detail = e?.response ? { status: e.response.status, data: e.response.data } : { message: String(e) };
+//     console.error("/alpaca/scan error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
+// premarket gap up / down
+app.get("/alpaca/scan/pre/gapup",   (req,res)=>res.redirect(`/alpaca/scan?session=pre&filter=gapup&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+app.get("/alpaca/scan/pre/gapdown", (req,res)=>res.redirect(`/alpaca/scan?session=pre&filter=gapdown&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+
+// regular-session gap up / down (open vs prev close)
+app.get("/alpaca/scan/regular/gapup",   (req,res)=>res.redirect(`/alpaca/scan?session=regular&filter=gapup&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+app.get("/alpaca/scan/regular/gapdown", (req,res)=>res.redirect(`/alpaca/scan?session=regular&filter=gapdown&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+
+// postmarket gap up / down
+app.get("/alpaca/scan/post/gapup",   (req,res)=>res.redirect(`/alpaca/scan?session=post&filter=gapup&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+app.get("/alpaca/scan/post/gapdown", (req,res)=>res.redirect(`/alpaca/scan?session=post&filter=gapdown&minGap=${req.query.minGap ?? 0.02}&top=${req.query.top ?? 50}`));
+
+// GET /alpaca/scan
+// Query:
+//   by=volume|trade_count   (default volume)
+//   top=number              (default 30)
+//   refresh=1|0             (default 1; when 1 we push into history)
+//   session=pre|regular|post (default regular)
+//   filter=gapup|gapdown|"" (default "")
+//   minGap=float            (default 0.02 = 2%)
+// app.get("/alpaca/scan", async (req, res) => {
+//   try {
+//     const by      = String(req.query.by || "volume").toLowerCase();
+//     const top     = Math.max(1, Number(req.query.top || 30));
+//     const refresh = req.query.refresh === "0" ? 0 : 1;
+
+//     let session   = String(req.query.session || "regular").toLowerCase();
+//     if (!["pre","regular","post"].includes(session)) session = "regular";
+
+//     let filter    = String(req.query.filter || "").toLowerCase();
+//     if (!["","gapup","gapdown"].includes(filter)) filter = "";
+
+//     const minGap  = Number.isFinite(+req.query.minGap) ? Math.max(0, Number(req.query.minGap)) : 0.02;
+
+//     if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
+//       return res.status(400).json({ ok:false, error: "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
+//     }
+//     if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret) {
+//       return res.status(400).json({ ok:false, error: "Missing Alpaca credentials" });
+//     }
+
+//     // 1) Fetch most-actives + movers
+//     const [actives, mv] = await Promise.all([
+//       alpacaMostActives({ by, top }),
+//       alpacaMovers({ top })
+//     ]);
+//     const gainers = Array.isArray(mv.gainers) ? mv.gainers : [];
+//     const losers  = Array.isArray(mv.losers)  ? mv.losers  : [];
+
+//     // 2) Universe to enrich
+//     const wanted = [...new Set([
+//       ...actives.map(x => x.symbol),
+//       ...gainers.map(x => x.symbol),
+//       ...losers.map(x => x.symbol),
+//     ])];
+
+//     // 3) Snapshots + daily bars (for ATR)
+//     const [snaps, barsMap] = await Promise.all([
+//       alpacaSnapshots(wanted),
+//       alpacaDailyBars(wanted, 20)
+//     ]);
+
+//     // 4) Decorate (session-aware price, gap, ATR)
+//     const mostDecorated = decorateRows(actives, snaps, barsMap, session);
+//     const gDecorated    = decorateRows(gainers, snaps, barsMap, session);
+//     const lDecorated    = decorateRows(losers,  snaps, barsMap, session);
+
+//     // 5) Optionally push HISTORY (use UNFILTERED so history is comparable over time)
+//     if (refresh) {
+//       pushHistory({
+//         most_actives_by: by,
+//         most_actives: mostDecorated,
+//         gainers: gDecorated,
+//         losers: lDecorated
+//       });
+//     }
+
+//     // 6) Build lightweight 7d hit history
+//     const hitCount = {};
+//     for (const snap of ALP_HISTORY) {
+//       for (const r of (snap.most_actives || [])) hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+//       for (const r of (snap.gainers || []))      hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+//       for (const r of (snap.losers || []))       hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+//     }
+//     const history = {
+//       days: 7,
+//       samples: ALP_HISTORY.length,
+//       top_hits: Object.entries(hitCount)
+//         .sort((a,b)=>b[1]-a[1])
+//         .slice(0, 50)
+//         .map(([symbol, hits]) => ({ symbol, hits }))
+//     };
+
+//     // 7) Apply gap filter ONLY to the response (not to history)
+//     const most = filterByGap(mostDecorated, filter, minGap);
+//     const g    = filterByGap(gDecorated,    filter, minGap);
+//     const l    = filterByGap(lDecorated,    filter, minGap);
+
+//     return res.json({
+//       ok: true,
+//       ts: Date.now(),
+//       params: { by, top, session, filter, minGap, refresh },
+//       groups: {
+//         most_actives: most,
+//         gainers: g,
+//         losers: l
+//       },
+//       history
+//     });
+//   } catch (e) {
+//     const detail = e?.response ? { status: e.response.status, data: e.response.data } : { message: String(e) };
+//     console.error("/alpaca/scan error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
+// Keep your ALP_HISTORY + pushHistory as before
+// const ALP_HISTORY = []; function pushHistory(snap) { ... }
+
 app.get("/alpaca/scan", async (req, res) => {
   try {
-    const by      = String(req.query.by || "volume");      // "volume" | "trade_count"
+    const by      = String(req.query.by || "volume");   // "volume" | "trade_count"
     const top     = Number(req.query.top || 30);
     const refresh = req.query.refresh === "0" ? 0 : 1;
 
-    // NEW: filters
-    let session = String(req.query.session || "regular").toLowerCase(); // "pre" | "regular" | "post"
+    let session = String(req.query.session || "regular").toLowerCase();
     if (!["pre","regular","post"].includes(session)) session = "regular";
 
-    let filter = String(req.query.filter || "").toLowerCase(); // "gapup" | "gapdown" | ""
-    if (!["gapup","gapdown",""].includes(filter)) filter = "";
+    let filter = String(req.query.filter || "").toLowerCase(); // "", "gapup", "gapdown"
+    if (!["","gapup","gapdown"].includes(filter)) filter = "";
 
-    const minGap = Number.isFinite(+req.query.minGap) ? Math.max(0, Number(req.query.minGap)) : 0.02; // 2%
+    const minGap = Number.isFinite(+req.query.minGap) ? Math.max(0, Number(req.query.minGap)) : 0.02;
 
-    if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY) {
-      return res.status(400).json({ ok: false, error: "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
-    }
-    if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret) {
+    if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY)
+      return res.status(400).json({ ok:false, error:"Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
+    if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret)
       return res.status(400).json({ ok:false, error:"Missing Alpaca credentials" });
-    }
 
-    // Pull most-actives & movers (you already had this)
-    const [actives, mv] = await Promise.all([
-      alpacaMostActives({ by, top }),
-      alpacaMovers({ top })
-    ]);
-    const gainers = mv.gainers || [];
-    const losers  = mv.losers  || [];
+    // fresh pull or cached
+    let payload;
+    if (refresh) {
+      const [actives, mv] = await Promise.all([
+        alpacaMostActives({ by, top }),
+        alpacaMovers({ top })
+      ]);
+      const gainers = mv.gainers || [];
+      const losers  = mv.losers  || [];
 
-    // Build symbol universe to enrich
-    const wanted = [
-      ...new Set([
+      const wanted = [...new Set([
         ...actives.map(x => x.symbol),
         ...gainers.map(x => x.symbol),
         ...losers.map(x => x.symbol),
-      ])
-    ];
+      ])];
 
-    // Snapshots for price/prevClose/open; Daily bars for ATR
-    const [snaps, barsMap] = await Promise.all([
-      alpacaSnapshots(wanted),
-      alpacaDailyBars(wanted, 20)
-    ]);
+      const [snaps, barsMap] = await Promise.all([
+        alpacaSnapshots(wanted),
+        alpacaDailyBars(wanted, 20)
+      ]);
 
-    // Decorate with session-aware price, %change, gap %, ATR
-    const decorate = (rows) => rows.map(r => {
-      const sym = r.symbol || r.S;
-      const snap = snaps[sym] || {};
-      const { price, prevClose, openToday } = chooseSessionPrice(snap, session);
-      const isNum = (x) => Number.isFinite(x);
+      let most = decorateRows(actives, snaps, barsMap, session);
+      let g    = decorateRows(gainers, snaps, barsMap, session);
+      let l    = decorateRows(losers,  snaps, barsMap, session);
 
-      const change_pct = (isNum(price) && isNum(prevClose)) ? (price / prevClose - 1) : 0;
-      const gap_pct    = (isNum(openToday) && isNum(prevClose)) ? (openToday / prevClose - 1) : 0;
+      most = filterByGap(most, filter, minGap);
+      g    = filterByGap(g,    filter, minGap);
+      l    = filterByGap(l,    filter, minGap);
 
-      const atr14 = computeATR14(barsMap[sym] || []);
-
-      return {
-        ...r,
-        symbol: sym,
-        price,
-        last: price,
-        change_pct,  // e.g., 0.034 = +3.4%
-        gap_pct,     // open vs prev close
-        atr14,       // in price units
+      payload = {
+        ok: true, ts: Date.now(),
+        params: { by, top, session, filter, minGap },
+        groups: { most_actives: most, gainers: g, losers: l }
       };
-    });
 
-    let most = decorate(actives);
-    let g    = decorate(gainers);
-    let l    = decorate(losers);
-
-    // Apply gap filter if requested
-    if (filter === "gapup") {
-      const pred = (row) => Number.isFinite(row.gap_pct) && row.gap_pct >= minGap;
-      most = most.filter(pred);
-      g    = g.filter(pred);
-      l    = l.filter(pred);
-    } else if (filter === "gapdown") {
-      const pred = (row) => Number.isFinite(row.gap_pct) && row.gap_pct <= -minGap;
-      most = most.filter(pred);
-      g    = g.filter(pred);
-      l    = l.filter(pred);
+      // record to 7-day history (use UNFILTERED to make history meaningful)
+      const mostE = decorateRows(actives, snaps, barsMap, "regular");
+      const gE    = decorateRows(gainers, snaps, barsMap, "regular");
+      const lE    = decorateRows(losers,  snaps, barsMap, "regular");
+      pushHistory({ most_actives_by: by, most_actives: mostE, gainers: gE, losers: lE });
+    } else {
+      const latest = ALP_HISTORY[ALP_HISTORY.length - 1];
+      payload = latest ? {
+        ok: true, ts: latest.ts,
+        params: { by: latest.most_actives_by, top, session, filter, minGap },
+        groups: { most_actives: latest.most_actives, gainers: latest.gainers, losers: latest.losers }
+      } : { ok:false, error:"no cached scan yet" };
     }
 
-    return res.json({
-      ok: true,
-      ts: Date.now(),
-      params: { by, top, session, filter, minGap },
-      groups: {
-        most_actives: most,
-        gainers: g,
-        losers: l
-      }
-    });
+    // history summary
+    const hitCount = {};
+    for (const snap of ALP_HISTORY) {
+      for (const r of (snap.most_actives || [])) hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+      for (const r of (snap.gainers || []))      hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+      for (const r of (snap.losers || []))       hitCount[r.symbol] = (hitCount[r.symbol] || 0) + 1;
+    }
+    payload.history = {
+      days: 7,
+      samples: ALP_HISTORY.length,
+      top_hits: Object.entries(hitCount)
+        .sort((a,b)=>b[1]-a[1])
+        .slice(0, 50)
+        .map(([symbol, hits]) => ({ symbol, hits }))
+    };
+
+    res.json(payload);
   } catch (e) {
     const detail = e?.response ? { status: e.response.status, data: e.response.data } : { message: String(e) };
     console.error("/alpaca/scan error:", detail);
     res.status(detail.status || 500).json({ ok:false, error: detail });
   }
 });
+
+// app.get("/alpaca/scan", async (req, res) => {
+//   try {
+//     const by      = String(req.query.by || "volume"); // "volume" | "trade_count"
+//     const top     = Number(req.query.top || 30);
+//     const refresh = req.query.refresh === "0" ? 0 : 1;
+//     let session   = String(req.query.session || "regular").toLowerCase(); // "pre" | "regular" | "post"
+//     if (!["pre","regular","post"].includes(session)) session = "regular";
+//     let filter    = String(req.query.filter || "").toLowerCase(); // "" | "gapup" | "gapdown"
+//     if (!["","gapup","gapdown"].includes(filter)) filter = "";
+//     const minGap  = Number.isFinite(+req.query.minGap) ? Math.max(0, Number(req.query.minGap)) : 0.02;
+
+//     if (!APCA_API_KEY_ID || !APCA_API_SECRET_KEY)
+//       return res.status(400).json({ ok:false, error: "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY" });
+//     if (!CREDENTIALS.alpaca.key || !CREDENTIALS.alpaca.secret)
+//       return res.status(400).json({ ok:false, error: "Missing Alpaca credentials" });
+
+//     // 1) Pull most-actives + movers
+//     const [actives, mv] = await Promise.all([
+//       alpacaMostActives({ by, top }),
+//       alpacaMovers({ top })
+//     ]);
+//     const gainers = mv.gainers || [];
+//     const losers  = mv.losers  || [];
+
+//     // 2) Enrichment universe
+//     const wanted = [...new Set([
+//       ...actives.map(x => x.symbol),
+//       ...gainers.map(x => x.symbol),
+//       ...losers.map(x => x.symbol),
+//     ])];
+
+//     // 3) Snapshots (for prices) + Daily bars (for ATR)
+//     const [snaps, barsMap] = await Promise.all([
+//       alpacaSnapshots(wanted),
+//       alpacaDailyBars(wanted, 20)
+//     ]);
+
+//     // 4) Decorate then filter by session-aware gap
+//     let most = decorateRows(actives, snaps, barsMap, session);
+//     let g    = decorateRows(gainers, snaps, barsMap, session);
+//     let l    = decorateRows(losers,  snaps, barsMap, session);
+
+//     most = filterByGap(most, filter, minGap);
+//     g    = filterByGap(g,    filter, minGap);
+//     l    = filterByGap(l,    filter, minGap);
+
+//     res.json({
+//       ok: true,
+//       ts: Date.now(),
+//       params: { by, top, session, filter, minGap },
+//       groups: {
+//         most_actives: most,
+//         gainers: g,
+//         losers: l
+//       }
+//     });
+//   } catch (e) {
+//     const detail = e?.response ? { status: e.response.status, data: e.response.data } : { message: String(e) };
+//     console.error("/alpaca/scan error:", detail);
+//     res.status(detail.status || 500).json({ ok:false, error: detail });
+//   }
+// });
 
 // ======= COMBINED POPULAR (Alpaca by volume ∪ curated fallback) =======
 async function getPopularByVolume(top = 40) {
