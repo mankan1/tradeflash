@@ -66,30 +66,36 @@ const ORIGINS = [
   "http://localhost:5173",
   "http://localhost:8080",
   "http://localhost:8081",
+  /\.vercel\.app$/,                 // allow all Vercel previews
 ];
 
+function isAllowedOrigin(origin) {
+  return ORIGINS.some((rule) =>
+    rule instanceof RegExp ? rule.test(origin) : rule === origin
+  );
+}
+
 app.use((req, res, next) => {
-  // help caches pick correct variant per Origin
-  res.header("Vary", "Origin");
+  res.header("Vary", "Origin");     // ensure caches vary by Origin
   next();
 });
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);                 // curl / server-to-server
-      if (ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS: origin not allowed: ${origin}`));
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-request-id"],
-    credentials: false, // set to true only if you really need cookies/auth
-    maxAge: 86400,
-  })
-);
+const corsMiddleware = cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);          // curl/Postman or same-origin
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    return cb(new Error(`CORS: origin not allowed: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-request-id"],
+  credentials: false,                            // set true only if you use cookies
+  maxAge: 86400,
+  optionsSuccessStatus: 204,
+});
 
-// reply to preflight
-app.options("*", cors());
+app.use(corsMiddleware);
+// make preflights use the SAME rules
+app.options("*", corsMiddleware);
 
 // Important: Add CORS and headers
 // app.use((req, res, next) => {
